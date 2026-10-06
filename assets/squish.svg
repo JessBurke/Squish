@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Squish</title>
+  <!--
+    Squish app icon - vector master on a 256 x 256 grid.
+    A wide white envelope squeezed flat between two lime chevrons, with small
+    pressure lines at its sides, on a rounded indigo tile.
+    make_icon.py draws the same shapes from the same numbers (MASTER) to build
+    squish.png and squish.ico; the smaller icon sizes are simplified by hand there.
+  -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="8" x2="0" y2="248" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5B3FD9"/>
+      <stop offset="1" stop-color="#3B2A8C"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-50%" width="140%" height="200%">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+  </defs>
+
+  <!-- Tile -->
+  <rect x="8" y="8" width="240" height="240" rx="44" fill="url(#tile)"/>
+
+  <!-- Soft shadow under the envelope -->
+  <path transform="translate(0 6)" fill="#180C48" fill-opacity="0.43" filter="url(#soft)"
+        d="M62 96 Q128 102 194 96 Q204 96 204 106 Q214 128 204 150
+           Q204 160 194 160 Q128 154 62 160 Q52 160 52 150
+           Q42 128 52 106 Q52 96 62 96 Z"/>
+
+  <!-- Pressure lines either side of the envelope -->
+  <g fill="none" stroke="#FFFFFF" stroke-opacity="0.59" stroke-width="5" stroke-linecap="round">
+    <path d="M24 110 L37 114 M22 128 L37 128 M24 146 L37 142"/>
+    <path d="M232 110 L219 114 M234 128 L219 128 M232 146 L219 142"/>
+  </g>
+
+  <!-- Envelope: rounded rectangle 52,96 - 204,160 (corner 10) with its sides
+       pushed out 5 and its top and bottom pressed in 3; then the flap -->
+  <path fill="#FFFFFF"
+        d="M62 96 Q128 102 194 96 Q204 96 204 106 Q214 128 204 150
+           Q204 160 194 160 Q128 154 62 160 Q52 160 52 150
+           Q42 128 52 106 Q52 96 62 96 Z"/>
+  <path d="M66 106 L128 138 L190 106" fill="none" stroke="#4B34B8" stroke-width="9"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Chevrons pressing in from above and below -->
+  <g fill="none" stroke="#C6F45E" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M88 52 L128 78 L168 52"/>
+    <path d="M88 204 L128 178 L168 204"/>
+  </g>
+</svg>
