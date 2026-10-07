@@ -194,10 +194,10 @@ class MessageFieldTests(unittest.TestCase):
                             attachments=[{"display_name": "Client reply", "embedded": inner}])
         real = msgfile._read_message
 
-        def failing_inner(cf, storage, top_level=True, parent_codepage=None, depth=0):
+        def failing_inner(cf, storage, top_level=True, parent_codepage=None, depth=0, **kwargs):
             if depth:
                 raise msgfile.MsgFileError("damaged attached email")
-            return real(cf, storage, top_level, parent_codepage, depth)
+            return real(cf, storage, top_level, parent_codepage, depth, **kwargs)
 
         with mock.patch.object(msgfile, "_read_message", side_effect=failing_inner):
             f = msgfile.read_msg_bytes(data)
@@ -317,6 +317,87 @@ class MessageFieldTests(unittest.TestCase):
                          [(a["name"], a["size"]) for a in whole["attachments"]])
         self.assertEqual(in_place["attachments"][0]["name"], "C-101.pdf")
         self.assertLess(counted["bytes"], len(data) // 4)
+
+
+class AttachmentDataTests(unittest.TestCase):
+    """want_data(name, size): the bytes of the attachments the caller wants
+    (documents) are read; nothing else is."""
+
+    def build(self):
+        inner = mb.message_tree(subject="Client reply", body="see the attached calc", embedded=True,
+                                attachments=[{"long_name": "inner calc.pdf", "data": b"%PDF inner"}])
+        return mb.build_msg(subject="Docs", body="attached", attachments=[
+            mb.file_attachment("Report.pdf", b"%PDF-1.4 report", "application/pdf"),
+            {"long_name": "photo.jpg", "data": b"\xff\xd8 photo"},
+            {"long_name": "Big drawing.pdf", "data": b"x" * 5000},
+            {"display_name": "Client reply", "embedded": inner},
+        ])
+
+    def test_only_wanted_attachments_get_their_bytes(self):
+        asked = []
+
+        def want(name, size):
+            asked.append((name, size))
+            return name.lower().endswith(".pdf") and size <= 4096
+
+        f = msgfile.read_msg_bytes(self.build(), want_data=want)
+        data = dict((a["name"], a["data"]) for a in f["attachments"])
+        self.assertEqual(data["Report.pdf"], b"%PDF-1.4 report")
+        self.assertIsNone(data["photo.jpg"])
+        self.assertIsNone(data["Big drawing.pdf"])        # too big for this caller
+        self.assertIsNone(data["Client reply"])           # an attached email: never
+        # The size asked about is the data stream's, not PR_ATTACH_SIZE (the
+        # whole attachment object, which is listed as the attachment's size).
+        self.assertIn(("Report.pdf", 15), asked)
+        self.assertEqual(f["attachments"][0]["size"], 15 + 312)
+        # The attached email's own attachments are not read (one level only).
+        self.assertNotIn("inner calc.pdf", [name for name, _size in asked])
+        self.assertEqual(f["attachments"][3]["message"]["attachments"][0]["data"], None)
+
+    def test_without_want_data_nothing_is_read(self):
+        f = msgfile.read_msg_bytes(self.build())
+        self.assertEqual([a["data"] for a in f["attachments"]], [None, None, None, None])
+
+    def test_big_msg_reads_only_the_wanted_stream_in_place(self):
+        # A 3 MB drawing and a small report: only the report's bytes come off the disk.
+        data = mb.build_msg(subject="Drawings", body="See attached.", attachments=[
+            {"long_name": "C-101.dwg", "data": b"d" * 3000000},
+            {"long_name": "Report.pdf", "data": b"r" * 20000}])
+        self.assertGreater(len(data), msgfile._IN_MEMORY_LIMIT)
+        counted = {"bytes": 0}
+
+        class CountingFile(io.FileIO):
+            def readinto(self, buffer):
+                n = io.FileIO.readinto(self, buffer)
+                counted["bytes"] += n or 0
+                return n
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "big.msg")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            with io.BufferedReader(CountingFile(path, "r"), 64 * 1024) as f:
+                fields = msgfile._read_message(msgfile.CompoundFile(f, len(data)), None,
+                                               want_data=lambda name, size: name.endswith(".pdf"))
+        by_name = dict((a["name"], a["data"]) for a in fields["attachments"])
+        self.assertEqual(by_name["Report.pdf"], b"r" * 20000)
+        self.assertIsNone(by_name["C-101.dwg"])
+        self.assertLess(counted["bytes"], len(data) // 10)    # not the 3 MB drawing
+
+    def test_damaged_attachment_stream_keeps_the_email(self):
+        data = mb.build_msg(subject="Docs", body="attached", attachments=[
+            {"long_name": "Report.pdf", "data": b"r" * 20000}])
+        real_read = msgfile.CompoundFile.read
+
+        def failing_read(cf, entry, max_bytes=None):
+            if entry.size == 20000:
+                raise msgfile.MsgFileError("broken chain")
+            return real_read(cf, entry, max_bytes)
+
+        with mock.patch.object(msgfile.CompoundFile, "read", failing_read):
+            f = msgfile.read_msg_bytes(data, want_data=lambda name, size: True)
+        self.assertEqual(f["body"], "attached")
+        self.assertIsNone(f["attachments"][0]["data"])
 
 
 class CompressedRtfTests(unittest.TestCase):

@@ -4,9 +4,16 @@ date, build the digest and write the output files.
     run_project(project, progress=None, cancel=None) -> RunResult
 
 ``progress(stage, done, total, message)`` is called from the worker thread
-(stage is "scan", "read", "digest" or "write"; total is 0 when not yet known).
-``cancel`` is a threading.Event; a cancelled run writes no output files and no
-run log (the read cache is still saved, so the next run is quicker).
+(stage is "scan", "read", "documents", "digest" or "write"; total is 0 when not
+yet known). ``cancel`` is a threading.Event; a cancelled run writes no output
+files and no run log (the read caches are still saved, so the next run is
+quicker).
+
+Documents (v1.1): Word, Excel, PowerPoint and PDF files attached to the emails
+(read with the emails, and condensed by docs.py in the read threads, so their
+bytes are never all held at once) and loose files in the project's documents
+folder go into a separate documents digest (docdigest.py) next to the email
+digest. Documents never stop a run.
 
 Source folders are only ever read, never changed (the output folder may not be
 the email folder or inside it). The previous digest files are only replaced by
@@ -25,12 +32,14 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
-from . import cleaning, paths, readers
+from . import cleaning, docs, paths, readers
 from .digest import build_digest, DigestCancelled, PART_SIZES
+from .docdigest import build_documents_digest
+from .digest import _keyword_pattern   # focus keyword matching, the same for documents
 
-CACHE_VERSION = 3          # bump when the EmailRecord format changes
+CACHE_VERSION = 4          # bump when the EmailRecord format changes (4: documents' sha1)
 READ_WORKERS = 6           # network drives are slow; read a few files at once
 PROGRESS_INTERVAL = 0.05   # seconds between progress calls (at most ~20 a second)
 EMAIL_EXTENSIONS = (".msg", ".eml")
@@ -43,6 +52,18 @@ FOCUS_TEXT_MAX = 40        # keyword text shown in a focus run's file names
 CHARS_PER_TOKEN = 3.5      # digests are dense with dates, times and codes, so they
                            # split into more tokens than ordinary prose (~4 chars)
 CANCEL_CHECK_S = 0.5       # how often the read stage looks at Cancel while files are read
+DOCS_CACHE_VERSION = 1     # bump when the DocText format changes
+DOCS_UNUSED_DAYS = 30      # extracted documents not used for this long are dropped from the cache
+EXTRACT_AT_ONCE = 2        # documents condensed at once (bounds memory; the work is CPU-bound)
+KIND_EMAILS = "emails"
+KIND_DOCUMENTS = "documents"
+# Attachment types docs.py can't read that are still listed under "Other files"
+# in the documents digest (images and the like are only listed in the email digest).
+OTHER_DOC_EXT = (".doc", ".dot", ".dotm", ".xls", ".xlsb", ".xltx", ".xltm", ".ppt", ".pps",
+                 ".pptm", ".potx", ".dwg", ".dxf", ".dwf", ".dgn", ".rvt", ".ifc", ".nwd",
+                 ".nwc", ".mpp", ".vsd", ".vsdx", ".odt", ".ods", ".odp", ".kmz", ".kml")
+# DocText statuses that mean the contents could not be read ("unsupported" is expected)
+UNREAD_STATUSES = ("error", "too_big", "protected", "no_text")
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # The ' (only <dates>)' tag a dated run adds to its file names (see date_label)
@@ -55,8 +76,12 @@ _OUTPUT_TAIL = re.compile(
 # The end of a dated and/or focus run's file name (not the all-dates digest)
 _FILTER_TAG = re.compile(r"(%s| \(focus[^()]*\))( \(part \d+ of \d+\))?\.txt$" % _DATES_TAG,
                          re.I)
+# ' - documents - <dates>' in a documents digest's file name
+_DOCUMENTS_TAG = re.compile(r" - documents - (?=\d{4}-\d{2}-\d{2} to |undated)", re.I)
 _NO_ACCESS = "no access to this folder"
 _NOT_OPENED = "folder could not be opened"
+_DOCS_FOLDER_MISSING = "documents folder not found"
+_DOCS_FOLDER_IS_OUTPUT = "documents folder not read"
 
 
 class SquishError(Exception):
@@ -155,6 +180,13 @@ def is_folder_problem(message):
     """True for a ``failed`` entry that is a folder Squish could not open
     (not an email file it could not read)."""
     return (message or "").startswith((_NO_ACCESS, _NOT_OPENED))
+
+
+def is_doc_folder_problem(message):
+    """True for a ``doc_problems`` entry that is a folder (the documents folder,
+    or a folder inside it), not a document."""
+    return (message or "").startswith((_NO_ACCESS, _NOT_OPENED, _DOCS_FOLDER_MISSING,
+                                       _DOCS_FOLDER_IS_OUTPUT))
 
 
 def _same_or_inside(path, folder):
@@ -342,12 +374,16 @@ def save_cache(path, entries):
     Written as plain ASCII (ensure_ascii), so odd file names (which Python may
     hold as lone surrogates) are saved and read back unchanged.
     """
+    return _save_json_gz(path, {"version": CACHE_VERSION, "files": entries})
+
+
+def _save_json_gz(path, data):
+    """Write ``data`` as gzipped ASCII JSON via a temp file. Returns True if saved."""
     path = str(path)
     tmp = "%s.tmp-%d-%d" % (path, os.getpid(), threading.get_ident())
     try:
         with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as fh:
-            json.dump({"version": CACHE_VERSION, "files": entries}, fh,
-                      ensure_ascii=True, separators=(",", ":"))
+            json.dump(data, fh, ensure_ascii=True, separators=(",", ":"))
         os.replace(tmp, path)
     except (OSError, ValueError, TypeError):
         try:
@@ -388,7 +424,7 @@ def _usable_cache_entry(entry, mtime, size):
             and "date" in entry["record"])
 
 
-def _read_one(path, cached, known_stat=None):
+def _read_one(path, cached, known_stat=None, store=None, cancel=None):
     """Worker thread: (path, cache entry or None, error text or None, came from
     cache, error was the file being out of reach).
 
@@ -396,6 +432,11 @@ def _read_one(path, cached, known_stat=None):
     unchanged file costs no extra trip to the file server. "Out of reach" means
     the file couldn't be opened or read (OSError, e.g. the network dropped), as
     opposed to a file that was read but isn't a proper email.
+
+    ``store`` (a _DocStore) is given when documents attached to the emails are
+    wanted: the email is then read with its documents' bytes, which are
+    condensed here (in this thread) and dropped. A cached email read without
+    its documents (or whose documents are no longer in the store) is read again.
     """
     if known_stat is not None:
         mtime, size = known_stat
@@ -405,14 +446,24 @@ def _read_one(path, cached, known_stat=None):
         except OSError as exc:
             return path, None, _error_text(exc), False, True
         mtime, size = st.st_mtime, st.st_size
-    if _usable_cache_entry(cached, mtime, size):
+    if _usable_cache_entry(cached, mtime, size) and (store is None or _docs_ready(cached, store)):
         return path, cached, None, True, False
     try:
-        record = readers.read_email(path)
+        if store is None:
+            record = readers.read_email(path)
+        else:
+            record = readers.read_email(path, want_docs=True)
     except Exception as exc:
         return path, None, _error_text(exc), False, isinstance(exc, OSError)
     record["path"] = path
-    return path, {"mtime": mtime, "size": size, "record": record}, None, False, False
+    entry = {"mtime": mtime, "size": size, "record": record, "docs": False}
+    if store is not None:
+        try:
+            entry["docs"] = _extract_attachments(record, store, cancel)
+        except Exception:
+            entry["docs"] = False    # documents never stop a run; tried again next time
+        _drop_doc_bytes(record)
+    return path, entry, None, False, False
 
 
 def _merged_cache(old_cache, new_cache, files, scan_complete):
@@ -429,6 +480,289 @@ def _merged_cache(old_cache, new_cache, files, scan_complete):
         merged = dict(old_cache)
     merged.update(new_cache)
     return merged
+
+
+# --------------------------------------------------------------------------
+# Documents cache: <cache>/<project key>.docs.json.gz =
+#   {"version", "docs": {sha1: {"doc": DocText, "used": "YYYY-MM-DD"}},
+#    "files": {loose file path: {"size", "mtime", "sha1"}}}
+# --------------------------------------------------------------------------
+
+def docs_cache_path(project):
+    return paths.cache_dir() / ("%s.docs.json.gz" % _project_key(project))
+
+
+def load_docs_cache(path):
+    """(docs by sha1, loose files by path) from the documents cache; empty if
+    missing, out of date or damaged."""
+    try:
+        with gzip.open(str(path), "rt", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}, {}
+    if not isinstance(data, dict) or data.get("version") != DOCS_CACHE_VERSION:
+        return {}, {}
+    found = data.get("docs") if isinstance(data.get("docs"), dict) else {}
+    files = data.get("files") if isinstance(data.get("files"), dict) else {}
+    kept = dict((k, v) for k, v in found.items()
+                if isinstance(v, dict) and isinstance(v.get("doc"), dict) and "status" in v["doc"])
+    files = dict((k, v) for k, v in files.items() if isinstance(v, dict) and v.get("sha1"))
+    return kept, files
+
+
+def save_docs_cache(path, found, files, today=None):
+    """Save the documents cache (atomically), leaving out documents not used for
+    DOCS_UNUSED_DAYS days and loose files whose document is gone. Returns True if saved."""
+    today = today or date.today()
+    cutoff = (today - timedelta(days=DOCS_UNUSED_DAYS)).isoformat()
+    found = dict((k, v) for k, v in found.items() if str(v.get("used") or "") >= cutoff)
+    files = dict((k, v) for k, v in files.items() if v.get("sha1") in found)
+    return _save_json_gz(path, {"version": DOCS_CACHE_VERSION, "docs": found, "files": files})
+
+
+class _DocStore(object):
+    """The documents condensed so far, by sha1 of their bytes: loaded from the
+    documents cache, shared by the read threads (hence the lock), saved at the
+    end. Also remembers the sha1 of each loose file by path, size and time."""
+
+    def __init__(self, path):
+        self.path = path
+        self.docs, self.files = load_docs_cache(path)
+        self.lock = threading.Lock()
+        self.busy = set()            # sha1s being condensed right now
+        self.slots = threading.BoundedSemaphore(EXTRACT_AT_ONCE)
+        self.changed = False
+        self.extracted = 0           # documents condensed this run (not from the cache)
+        self.today = date.today().isoformat()
+
+    def has(self, sha1):
+        with self.lock:
+            return sha1 in self.docs
+
+    def get(self, sha1):
+        with self.lock:
+            entry = self.docs.get(sha1)
+        return entry["doc"] if entry else None
+
+    def claim(self, sha1):
+        """True if the caller should condense this document: nobody has, or is doing, it."""
+        with self.lock:
+            if sha1 in self.docs or sha1 in self.busy:
+                return False
+            self.busy.add(sha1)
+            return True
+
+    def put(self, sha1, doc):
+        """Store a condensed document (None: it wasn't done) and release the claim."""
+        with self.lock:
+            self.busy.discard(sha1)
+            if doc is not None:
+                self.docs[sha1] = {"doc": doc, "used": self.today}
+                self.extracted += 1
+                self.changed = True
+
+    def mark_used(self, sha1s):
+        """Mark documents as used today, so the cache keeps them."""
+        with self.lock:
+            for sha1 in sha1s:
+                entry = self.docs.get(sha1)
+                if entry is not None and entry.get("used") != self.today:
+                    entry["used"] = self.today
+                    self.changed = True
+
+    def file_sha1(self, path, size, mtime):
+        """The sha1 of an unchanged loose file seen before, else ''."""
+        with self.lock:
+            entry = self.files.get(path)
+        if isinstance(entry, dict) and entry.get("size") == size and entry.get("mtime") == mtime:
+            return str(entry.get("sha1") or "")
+        return ""
+
+    def remember_file(self, path, size, mtime, sha1):
+        with self.lock:
+            self.files[path] = {"size": size, "mtime": mtime, "sha1": sha1}
+            self.changed = True
+
+    def save(self):
+        """Save the cache if anything changed. Returns False if it couldn't be saved."""
+        if not self.changed:
+            return True
+        with self.lock:
+            found, files = dict(self.docs), dict(self.files)
+        if save_docs_cache(self.path, found, files):
+            self.changed = False
+            return True
+        return False
+
+
+def _doc_without_contents(name, status="", note=""):
+    """A DocText for a document whose contents were not read: a type docs.py
+    can't read (status "unsupported", from docs.extract), or ``status``/``note``
+    (e.g. "too_big") for one that was not read for another reason."""
+    doc = docs.extract(name)          # with no data or path this only names the kind
+    if status and doc.get("status") != "unsupported":
+        doc["status"], doc["note"] = status, note
+    return doc
+
+
+def _too_big_note():
+    return "larger than %d MB, not read" % (docs.DOC_MAX_BYTES // (1024 * 1024))
+
+
+def _extract_document(name, data, store, cancel):
+    """docs.extract on ``data``, at most EXTRACT_AT_ONCE at a time; None when
+    the run was cancelled first."""
+    while not store.slots.acquire(timeout=0.2):
+        if _is_cancelled(cancel):
+            return None
+    try:
+        if _is_cancelled(cancel):
+            return None
+        try:
+            return docs.extract(name, data=data)
+        except Exception as exc:   # docs.extract never raises; a document must never stop a run
+            return _doc_without_contents(name, "error", "could not read this file (%s)"
+                                         % type(exc).__name__)
+    finally:
+        store.slots.release()
+
+
+def _extract_attachments(record, store, cancel):
+    """Read-thread work: condense the documents attached to a freshly read email
+    (their bytes are in "_data", see readers.read_email) and drop the bytes.
+    A document already in the store (or being done by another thread) is not
+    done again. Returns False if the run was cancelled before all were done."""
+    complete = True
+    for att in record.get("attachments") or []:
+        data = att.pop("_data", None)
+        sha1 = att.get("sha1")
+        if data is None or not sha1 or not complete or not store.claim(sha1):
+            continue
+        doc = _extract_document(att.get("name") or "", data, store, cancel)
+        store.put(sha1, doc)
+        complete = doc is not None
+    return complete
+
+
+def _drop_doc_bytes(record):
+    """Make sure no attachment bytes are left in a record (it is cached as JSON)."""
+    for att in record.get("attachments") or []:
+        att.pop("_data", None)
+
+
+def _docs_ready(entry, store):
+    """True when a cached email was read with its documents and all of them are in the store."""
+    if not entry.get("docs"):
+        return False
+    for att in entry["record"].get("attachments") or []:
+        if isinstance(att, dict) and att.get("sha1") and not store.has(att["sha1"]):
+            return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# Documents folder (loose files)
+# --------------------------------------------------------------------------
+
+_HIDDEN_NAMES = ("thumbs.db", "desktop.ini", ".ds_store")
+_HIDDEN_OR_SYSTEM = 0x2 | 0x4      # Windows FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+
+
+def _is_hidden(entry):
+    """Hidden and system files and folders (and '~$' Office temp files) are skipped."""
+    name = entry.name
+    if name.startswith((".", "~$")) or name.lower() in _HIDDEN_NAMES:
+        return True
+    if os.name != "nt":
+        return False      # elsewhere a leading dot is what makes a file hidden
+    try:
+        attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attributes & _HIDDEN_OR_SYSTEM)
+
+
+def scan_documents(folder, include_subfolders=True, skip_folder="", cancel=None, progress=None,
+                   errors=None):
+    """List the loose documents in ``folder``: [(display path, mtime, size)], by path.
+
+    Skips email files (they are read as emails), Squish digest files, Office
+    '~$' temp files, hidden and system files and folders, and ``skip_folder``
+    (the output folder) with everything in it. Folders that can't be opened are
+    added to ``errors`` as [folder, message]. Returns None if cancelled.
+    """
+    skip = os.path.normcase(os.path.abspath(skip_folder)) if skip_folder else ""
+    found = []
+    pending = [paths.long_path(folder)]
+    while pending:
+        if _is_cancelled(cancel):
+            return None
+        current = pending.pop()
+        subfolders = []
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if _is_hidden(entry):
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            shown = paths.short_path(entry.path)
+                            if include_subfolders and not (skip and _same_or_inside(
+                                    os.path.abspath(shown), skip)):
+                                subfolders.append(entry.path)
+                        elif entry.is_file() and not is_email_file(entry.name) \
+                                and not is_digest_file_name(entry.name):
+                            st = entry.stat()
+                            found.append((paths.short_path(entry.path), st.st_mtime, st.st_size))
+                    except OSError:
+                        continue
+        except OSError as exc:
+            if errors is not None:
+                what = _NO_ACCESS if _is_no_access(exc) else _NOT_OPENED
+                errors.append([paths.short_path(current), "%s: %s" % (what, _error_text(exc))])
+            continue
+        subfolders.sort(key=lambda p: p.lower(), reverse=True)
+        pending.extend(subfolders)
+        if progress:
+            progress("scan", len(found), 0, "Looking for documents... %d found" % len(found))
+    found.sort(key=lambda item: item[0].lower())
+    return found
+
+
+def _loose_document(item, store, cancel):
+    """Documents-thread work for one loose file: (item, key, sha1, DocText or
+    None if cancelled). Unchanged files and identical contents come from the
+    store; only supported types up to docs.DOC_MAX_BYTES are read."""
+    path, mtime, size = item
+    name = os.path.basename(path)
+    if not docs.is_supported(name):
+        return item, _name_key(name, size), "", _doc_without_contents(name)
+    if size > docs.DOC_MAX_BYTES:
+        return item, _name_key(name, size), "", _doc_without_contents(name, "too_big",
+                                                                       _too_big_note())
+    sha1 = store.file_sha1(path, size, mtime)
+    doc = store.get(sha1) if sha1 else None
+    if doc is not None:
+        return item, sha1, sha1, doc
+    try:
+        with open(paths.long_path(path), "rb") as fh:
+            data = fh.read(docs.DOC_MAX_BYTES + 1)
+    except OSError as exc:
+        return item, _name_key(name, size), "", _doc_without_contents(
+            name, "error", "could not be opened (%s)" % _error_text(exc))
+    sha1 = hashlib.sha1(data).hexdigest()
+    store.remember_file(path, size, mtime, sha1)
+    doc = store.get(sha1)
+    if doc is None:
+        doc = _extract_document(name, data, store, cancel)
+        if doc is not None:
+            store.put(sha1, doc)
+    return item, sha1, sha1, doc
+
+
+def _name_key(name, size):
+    """The key of a document whose bytes were not read: its name and size."""
+    return "name:%s|%s" % ((name or "").lower(), size if size is not None else "?")
 
 
 # --------------------------------------------------------------------------
@@ -573,7 +907,7 @@ def _part_span(part):
     return "undated"
 
 
-def output_filenames(name, parts, focus="", folder="", dates=""):
+def output_filenames(name, parts, focus="", folder="", dates="", kind=KIND_EMAILS):
     """File names for the digest parts, e.g. 'Squish - X - 2024-01-02 to 2024-09-30 (part 1 of 2).txt'.
 
     Each part is named with its own date range. The project name is shortened
@@ -583,9 +917,12 @@ def output_filenames(name, parts, focus="", folder="", dates=""):
     digest: '... 2025-01-02 to 2025-01-30 (only 2025-01-01 to 2025-01-31) (focus pump).txt'.
     When ``folder`` (the output folder) is given and a path would be longer
     than PATH_BUDGET characters, the focus text is shortened (see _short_focus)
-    so the files can still be dragged from Explorer.
+    so the files can still be dragged from Explorer. A documents digest
+    (``kind`` "documents") is 'Squish - X - documents - <dates>....txt'.
     """
     safe = paths.output_name(name)
+    if kind == KIND_DOCUMENTS:
+        safe += " - documents"
     dates_tag = " (%s)" % dates if dates else ""
 
     def names_with(focus_text):
@@ -616,13 +953,15 @@ def _short_focus(focus, room):
     return text.rstrip(" ,.") + code
 
 
-def is_old_output(filename, name):
-    """True for a digest file this project wrote earlier ('Squish - <name> - <dates>....txt').
+def is_old_output(filename, name, kind=KIND_EMAILS):
+    """True for a digest file this project wrote earlier ('Squish - <name> - <dates>....txt',
+    or for ``kind`` "documents" 'Squish - <name> - documents - <dates>....txt').
 
     <name> is the project name as output_filenames writes it, or (for files
     written before long names were shortened) the whole safe file name."""
+    middle = " - documents - " if kind == KIND_DOCUMENTS else " - "
     for shown in (paths.output_name(name), paths.safe_filename(name, "Project")):
-        prefix = "%s%s - " % (OUTPUT_PREFIX, shown)
+        prefix = "%s%s%s" % (OUTPUT_PREFIX, shown, middle)
         if filename.lower().startswith(prefix.lower()) and _OUTPUT_TAIL.match(filename[len(prefix):]):
             return True
     return False
@@ -639,6 +978,14 @@ def is_digest_file_name(filename):
             return True
         at = rest.find(" - ", at + 1)
     return False
+
+
+def digest_file_kind(filename):
+    """"documents" for a documents digest file name, "emails" for an email digest
+    file name, "" for anything else."""
+    if not is_digest_file_name(filename):
+        return ""
+    return KIND_DOCUMENTS if _DOCUMENTS_TAG.search(filename) else KIND_EMAILS
 
 
 def filter_key(date_from, date_to, keywords):
@@ -694,14 +1041,16 @@ def _put_back(placed, moved, tmps):
     return ok
 
 
-def _write_parts(out_dir, parts, names, report, cancel=None):
+def _write_parts(out_dir, parts, names, report, cancel=None, kinds=None):
     """Write the digest parts as ``names`` in ``out_dir``; returns the file info list.
 
     All parts are written to temp files first, then the files they replace are
     moved aside, then the new ones are put in place. If anything fails, the
     folder is put back the way it was and SquishError is raised. Cancel is
     checked only while the temp files are written (returns None, nothing
-    changed), so the swap itself is all or nothing.
+    changed), so the swap itself is all or nothing. ``kinds`` gives each
+    part's kind ("emails" or "documents"; all "emails" if not given), so the
+    email and documents digests are written in one all-or-nothing swap.
     """
     if not parts:
         return []
@@ -768,10 +1117,10 @@ def _write_parts(out_dir, parts, names, report, cancel=None):
     report("write", len(parts), len(parts), "Saved %d file(s)" % len(parts))
 
     written = []
-    for part, target in zip(parts, targets):
+    for i, (part, target) in enumerate(zip(parts, targets)):
         text = part.get("text") or ""
         chars = len(text)
-        written.append({
+        info = {
             "path": target,
             "chars": chars,
             "bytes": len(text.encode("utf-8", "replace")),
@@ -780,7 +1129,11 @@ def _write_parts(out_dir, parts, names, report, cancel=None):
             "last_date": part.get("last_date") or "",
             "emails": int(part.get("emails") or 0),
             "threads": int(part.get("threads") or 0),
-        })
+            "kind": kinds[i] if kinds else KIND_EMAILS,
+        }
+        if info["kind"] == KIND_DOCUMENTS:
+            info["documents"] = int(part.get("documents") or 0)
+        written.append(info)
     return written
 
 
@@ -818,33 +1171,53 @@ def _save_manifest(path, folders):
         return False
 
 
-def _previous_files_here(project, folder_key, filtered):
+def _previous_files_here(project, folder_key, filtered, kind=KIND_EMAILS):
     """Names of the files the project's last run wrote (``previous_files``, passed
     in by the GUI) that are in this output folder and are the same kind of run
-    as this one (``filtered``: with a date filter or focus keywords, or neither)."""
+    as this one (``filtered``: with a date filter or focus keywords, or neither;
+    ``kind``: an email or a documents digest)."""
     names = []
     for path in project.get("previous_files") or []:
         path = str(path or "")
         if not path or os.path.normcase(os.path.abspath(os.path.dirname(path))) != folder_key:
             continue
         filename = os.path.basename(path)
-        if bool(_FILTER_TAG.search(filename)) == filtered:
+        if bool(_FILTER_TAG.search(filename)) == filtered and digest_file_kind(filename) == kind:
             names.append(filename)
     return names
 
 
-def _remove_older_outputs(project, out_dir, new_names, run_key):
+def manifest_key(filter_text, kind=KIND_EMAILS):
+    """The key under which .outputs.json records a kind of run: the filter_key for
+    the email digest, "documents" (plus " | " and the filter_key) for the
+    documents digest, so the two never replace each other's files."""
+    if kind != KIND_DOCUMENTS:
+        return filter_text
+    return KIND_DOCUMENTS + (" | " + filter_text if filter_text else "")
+
+
+def _kind_of_key(key):
+    """The kind of digest ("emails" or "documents") a manifest_key belongs to."""
+    if key == KIND_DOCUMENTS or str(key).startswith(KIND_DOCUMENTS + " | "):
+        return KIND_DOCUMENTS
+    return KIND_EMAILS
+
+
+def _remove_older_outputs(project, out_dir, new_names, filter_text, kind=KIND_EMAILS):
     """Delete this project's older digest files that the new ones replace.
 
     Returns (removed names, error lines). Replaced: the files the previous run
     of the same kind wrote (whatever the project was called then, so renaming a
     project leaves no stale files behind); and, for a run without date or
-    keyword filters, any other older 'Squish - <name> - <dates>.txt' file that
+    keyword filters, any other older 'Squish - <name> - <dates>.txt' file (or
+    'Squish - <name> - documents - <dates>.txt' for the documents digest) that
     no filtered run wrote. If the list of what each run wrote is missing, the
     project's ``previous_files`` (from the GUI) stand in for it. Only files
-    whose names follow the digest pattern are ever deleted.
+    whose names follow the digest pattern are ever deleted. ``filter_text`` is
+    the run's filter_key.
     """
     name = project_name(project)
+    run_key = manifest_key(filter_text, kind)
     manifest_file = manifest_path(project)
     folders = _load_manifest(manifest_file)
     folder_key = os.path.normcase(os.path.abspath(out_dir))
@@ -858,11 +1231,12 @@ def _remove_older_outputs(project, out_dir, new_names, run_key):
             others.update(str(n).lower() for n in names)
 
     ours = set(str(n) for n in owners.get(run_key) or [])
-    if not owners:
-        filtered = run_key != ""
-        ours.update(_previous_files_here(project, folder_key, filtered))
+    if not any(_kind_of_key(key) == kind for key in owners):
+        # No record of this kind of digest here (lost, or written before records were kept)
+        filtered = filter_text != ""
+        ours.update(_previous_files_here(project, folder_key, filtered, kind))
     candidates = set(ours)
-    if run_key == "":
+    if filter_text == "":
         try:
             existing = os.listdir(paths.long_path(out_dir))
         except OSError:
@@ -874,7 +1248,10 @@ def _remove_older_outputs(project, out_dir, new_names, run_key):
         low = filename.lower()
         if low in new_lower or low in others:
             continue
-        if not (is_digest_file_name(filename) if filename in ours else is_old_output(filename, name)):
+        if filename in ours:
+            if not is_digest_file_name(filename):
+                continue
+        elif not is_old_output(filename, name, kind):
             continue
         path = os.path.join(out_dir, filename)
         if not os.path.exists(paths.long_path(path)):
@@ -903,7 +1280,7 @@ def _remove_older_outputs(project, out_dir, new_names, run_key):
 
 
 # --------------------------------------------------------------------------
-# The run
+# Run results
 # --------------------------------------------------------------------------
 
 def _empty_result(output_folder):
@@ -915,6 +1292,7 @@ def _empty_result(output_folder):
         "files_read": 0,
         "from_cache": 0,
         "failed": [],
+        "doc_problems": [],
         "stats": {},
         "elapsed_s": 0.0,
         "log_path": "",
@@ -934,31 +1312,336 @@ def _cancelled_result(result, started):
     return result
 
 
-def _make_digest(kept, project, source, outside, cancel, report, no_access=0, unreadable=0):
+def _make_digest(kept, project, source, outside, cancel, report, no_access=0, unreadable=0,
+                 doc_ids=None):
     """build_digest with Cancel and progress. Returns None if the run was
     cancelled while the digest was being built. ``outside`` is the list of
     emails the date filter left out (counted in the header, and used only so
     that quoting them does not 'recover' them); ``no_access`` is the number of
     emails left out because Squish can't open their folder, and ``unreadable``
     the number of email files that couldn't be read (both said in the header,
-    so Claude knows emails may be missing)."""
+    so Claude knows emails may be missing). ``doc_ids`` (only passed on when
+    there are documents) marks attachments with their documents digest ID."""
 
     def digest_progress(done, total):
         report("digest", done, total, "Squishing emails... %d of %d" % (done, total))
 
+    extra = {"doc_ids": doc_ids} if doc_ids else {}
     try:
         return build_digest(kept, project, source_label=source, outside_dates=len(outside),
                             cancel=cancel, progress=digest_progress, also_filed=outside,
-                            no_access_emails=no_access, unreadable_files=unreadable)
+                            no_access_emails=no_access, unreadable_files=unreadable, **extra)
     except DigestCancelled:
         return None
 
+
+# --------------------------------------------------------------------------
+# Documents: which ones, their IDs, and where they came from
+# --------------------------------------------------------------------------
+
+def _scan_documents_folder(folder, project, out_dir, cancel, report, problems):
+    """The loose files in the documents folder (see scan_documents), or None if
+    cancelled. A folder that can't be used is added to ``problems`` and gives
+    no files: documents never stop a run."""
+    if not os.path.isdir(paths.long_path(folder)):
+        problems.append([folder, "%s: if it is on a network drive, check that you are "
+                                 "connected to the office network or VPN" % _DOCS_FOLDER_MISSING])
+        return []
+    if _same_or_inside(os.path.abspath(folder), os.path.abspath(out_dir)):
+        problems.append([folder, "%s: it is the output folder (or inside it)"
+                                 % _DOCS_FOLDER_IS_OUTPUT])
+        return []
+    report("scan", 0, 0, "Looking for documents...")
+    errors = []
+    found = scan_documents(folder, project.get("docs_include_subfolders", True), out_dir,
+                           cancel, report, errors)
+    problems.extend(errors)
+    return found
+
+
+def _read_loose_documents(items, store, cancel, report):
+    """Condense the loose files, a few at a time (cached ones are quick).
+    Returns [(item, key, sha1, DocText)] by path, or None if cancelled."""
+    total = len(items)
+    results = []
+    report("documents", 0, total, "Reading documents...")
+    if not total:
+        return results
+    finished = queue.Queue()
+    with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+        futures = {}
+        for item in items:
+            future = pool.submit(_loose_document, item, store, cancel)
+            future.add_done_callback(finished.put)
+            futures[future] = item
+        while len(results) < total:
+            try:
+                future = finished.get(timeout=CANCEL_CHECK_S)
+            except queue.Empty:
+                future = None
+            if future is not None:
+                try:
+                    results.append(future.result())
+                except Exception as exc:   # documents never stop a run
+                    item = futures[future]
+                    name = os.path.basename(item[0])
+                    results.append((item, _name_key(name, item[2]), "", _doc_without_contents(
+                        name, "error", "could not read this file (%s)" % type(exc).__name__)))
+                report("documents", len(results), total,
+                       "Reading documents... %d of %d" % (len(results), total))
+            if _is_cancelled(cancel):
+                for f in futures:
+                    f.cancel()
+                return None
+    if any(doc is None for _item, _key, _sha1, doc in results):
+        return None     # cancelled while a document was waiting its turn
+    results.sort(key=lambda r: r[0][0].lower())
+    return results
+
+
+def _email_time(rec):
+    """Seconds since 1970 of an email's date, for ordering (undated emails last)."""
+    text = (rec.get("date") or "").strip()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return float("inf")
+
+
+def _attachment_document(att, store):
+    """(key, sha1, DocText) for an email attachment that belongs in the documents
+    digest, or None (images, attached emails and other files that are only
+    listed in the email digest)."""
+    if not isinstance(att, dict) or att.get("inline") or att.get("email") is not None:
+        return None
+    name = att.get("name") or ""
+    sha1 = att.get("sha1") or ""
+    if sha1:
+        doc = store.get(sha1)
+        if doc is None:
+            doc = _doc_without_contents(name, "error", "not read")
+        return sha1, sha1, doc
+    size = att.get("size")
+    if docs.is_supported(name):
+        if isinstance(size, int) and size > docs.DOC_MAX_BYTES:
+            return (_name_key(name, size), "",
+                    _doc_without_contents(name, "too_big", _too_big_note()))
+        return _name_key(name, size), "", _doc_without_contents(
+            name, "error", "the attachment's contents could not be read")
+    if os.path.splitext(name)[1].lower() in OTHER_DOC_EXT:
+        return _name_key(name, size), "", _doc_without_contents(name)
+    return None
+
+
+def _collect_documents(records, loose, store):
+    """The run's documents, each once, in order of first appearance: the
+    attachments of ``records`` by email date, then the loose files by path.
+    Identical contents (same sha1; same name and size for files that were not
+    read) are one document. Each is a dict: id ("D1"... for documents whose
+    contents were read, else ""), key, name, sha1, size, doc (DocText), emails
+    [(record, attachment index)] and files [(path, mtime, size)]."""
+    found = {}
+    for rec in sorted(records, key=lambda r: (_email_time(r), (r.get("path") or "").lower())):
+        for index, att in enumerate(rec.get("attachments") or []):
+            item = _attachment_document(att, store)
+            if item is None:
+                continue
+            key, sha1, doc = item
+            if key not in found:
+                found[key] = {"key": key, "name": att.get("name") or "", "sha1": sha1,
+                              "size": att.get("doc_size") or att.get("size"), "doc": doc,
+                              "emails": [], "files": []}
+            found[key]["emails"].append((rec, index))
+    for (path, mtime, size), key, sha1, doc in loose:
+        if key not in found:
+            found[key] = {"key": key, "name": os.path.basename(path), "sha1": sha1,
+                          "size": size, "doc": doc, "emails": [], "files": []}
+        found[key]["files"].append((path, mtime, size))
+    numbered = 0
+    for d in found.values():
+        d["id"] = ""
+        if d["doc"].get("status") == "ok":
+            numbered += 1
+            d["id"] = "D%d" % numbered
+    return list(found.values())
+
+
+def _doc_ids(found):
+    """{(record path, attachment index): "D12"} for the email digest's '=D12' marks."""
+    ids = {}
+    for d in found:
+        if d["id"]:
+            for rec, index in d["emails"]:
+                ids[(rec.get("path") or "", index)] = d["id"]
+    return ids
+
+
+def _used_sha1s(records, loose):
+    """Every document sha1 this project refers to (also outside the dates), so the
+    documents cache keeps them."""
+    used = set(sha1 for _item, _key, sha1, _doc in loose if sha1)
+    for rec in records:
+        for att in rec.get("attachments") or []:
+            if isinstance(att, dict) and att.get("sha1"):
+                used.add(att["sha1"])
+    return used
+
+
+_SHOWN_ID = re.compile(r"(?<= )=(D\d+)(?![0-9A-Za-z])")
+
+
+def _shown_doc_ids(email_parts):
+    """The document IDs ('D12') the email digest shows in its '[att: ...]' lists
+    (only below the header, whose "How to read" line has an example)."""
+    shown = set()
+    for part in email_parts or []:
+        text = part.get("text") or ""
+        start = text.find("\n## ")
+        if start < 0:
+            continue
+        for line in text[start:].split("\n"):
+            at = line.find("[att: ")
+            if at >= 0:
+                shown.update(_SHOWN_ID.findall(line[at:]))
+    return shown
+
+
+def _doc_search_text(name, doc):
+    """A document's name, title and text in one string (zip members' documents too)."""
+    pieces = [name or "", doc.get("title") or ""]
+    for block in doc.get("blocks") or []:
+        pieces.append(block.get("text") or "")
+        if isinstance(block.get("doc"), dict):
+            pieces.append(_doc_search_text("", block["doc"]))
+    return "\n".join(pieces)
+
+
+def _focus_documents(found, keywords, email_parts):
+    """The documents a run with focus keywords keeps: a keyword in the document's
+    name or text (matched like the email digest's keywords), or its '=Dn' mark
+    shown in the email digest (it is attached to an email in a kept thread).
+    Without keywords, all of them."""
+    words = cleaning.keyword_list(keywords)
+    if not words:
+        return list(found)
+    patterns = [_keyword_pattern(cleaning.fold_for_match(w).strip()) for w in words]
+    shown = _shown_doc_ids(email_parts)
+    kept = []
+    for d in found:
+        if d["id"] and d["id"] in shown:
+            kept.append(d)
+            continue
+        text = cleaning.fold_for_match(_doc_search_text(d["name"], d["doc"]))
+        if any(p.search(text) for p in patterns):
+            kept.append(d)
+    return kept
+
+
+def _local_iso(timestamp):
+    """A file time as local ISO 8601 with offset, like EmailRecord dates ('' if unknown)."""
+    try:
+        return datetime.fromtimestamp(timestamp).astimezone().replace(microsecond=0).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
+def _documents_for_digest(found, aliases):
+    """The ``docs`` list for docdigest.build_documents_digest (see DESIGN.md):
+    id, name, sha1, size, doc and sources (emails oldest first, one per email
+    even when Mail Manager filed it in several folders; then loose files)."""
+    out = []
+    for d in found:
+        sources, seen = [], set()
+        for rec, _index in d["emails"]:
+            subject = rec.get("subject") or ""
+            sender = (rec.get("sender_email") or rec.get("sender_name") or "").lower()
+            key = ((rec.get("date") or "")[:16], sender, cleaning.thread_key(subject))
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append({"kind": "email", "date": rec.get("date") or "",
+                            "sender_alias": aliases.get(rec.get("path") or "", ""),
+                            "sender_name": rec.get("sender_name") or "",
+                            "sender_email": rec.get("sender_email") or "",
+                            "subject": subject, "thread": cleaning.clean_subject(subject),
+                            "path": rec.get("path") or ""})
+        for path, mtime, _size in d["files"]:
+            sources.append({"kind": "file", "path": path, "mtime": _local_iso(mtime)})
+        out.append({"id": d["id"], "name": d["name"], "sha1": d["sha1"], "size": d["size"],
+                    "doc": d["doc"], "sources": sources})
+    return out
+
+
+def _documents_source_label(source, want_attachments, docs_folder):
+    """'H:\\Jobs\\01 Emails (attachments) + H:\\Jobs\\04 Reports', for the documents
+    digest's header."""
+    labels = []
+    if want_attachments:
+        labels.append("%s (attachments)" % source)
+    if docs_folder:
+        labels.append(docs_folder)
+    return " + ".join(labels)
+
+
+def _make_documents_digest(shown, aliases, project, source_label, notes):
+    """build_documents_digest for the documents kept, or None (with a note for
+    the run log) if it failed: documents never stop a run. ``aliases`` is the
+    email digest's {record path: sender alias} (its result's "aliases")."""
+    try:
+        return build_documents_digest(_documents_for_digest(shown, aliases), project,
+                                      source_label=source_label)
+    except Exception as exc:
+        notes.append("The documents digest could not be made (%s: %s), so only the email digest "
+                     "was written." % (type(exc).__name__, exc))
+        return None
+
+
+def _document_problems(found):
+    """[[where, reason]] for the documents whose contents could not be read."""
+    problems = []
+    for d in found:
+        doc = d["doc"]
+        if doc.get("status") not in UNREAD_STATUSES:
+            continue
+        if d["files"]:
+            where = d["files"][0][0]
+        else:
+            where = "%s (attached to %s)" % (d["name"], d["emails"][0][0].get("path") or "")
+        problems.append([where, doc.get("note") or doc.get("status")])
+    return problems
+
+
+def _document_stats(shown, digest_stats):
+    """RunResult stats for the documents digest. docdigest's own numbers win
+    where it has them (it decides what is a drawing or a later version)."""
+    ok = [d for d in shown if d["doc"].get("status") == "ok"]
+    mine = {
+        "documents": sum(1 for d in ok if not d["doc"].get("drawing")),
+        "doc_drawings": sum(1 for d in ok if d["doc"].get("drawing")),
+        "doc_other": len(shown) - len(ok),
+        "doc_versions": 0,
+        "doc_failed": sum(1 for d in shown if d["doc"].get("status") in UNREAD_STATUSES),
+    }
+    theirs = digest_stats or {}
+    return dict((k, theirs[k] if isinstance(theirs.get(k), int) else v) for k, v in mine.items())
+
+
+def _save_doc_store(store, notes):
+    if store is not None and not store.save():
+        notes.append("The documents cache could not be saved, so the next run will read the "
+                     "documents again.")
+
+
+# --------------------------------------------------------------------------
+# The run
+# --------------------------------------------------------------------------
 
 def run_project(project, progress=None, cancel=None):
     """Scan, read, filter, digest and write one project. Returns a RunResult dict.
 
     Raises SquishError for problems the user can fix (missing folder, bad dates,
     output folder not writable, the folder stopping responding part way).
+    Documents (attachments and the documents folder) never stop a run.
     """
     started = time.time()
     report = _Progress(progress)
@@ -970,6 +1653,8 @@ def run_project(project, progress=None, cancel=None):
     if date_from and date_to and date_from > date_to:
         raise SquishError("The 'from' date (%s) is after the 'to' date (%s)." % (date_from, date_to))
     keywords = project.get("focus_keywords") or ""
+    want_attachments = bool(project.get("docs_from_attachments", True))
+    docs_folder = paths.clean_folder_text(project.get("docs_folder"))
     result = _empty_result(out_dir)
     timings = {}
     notes = []
@@ -1001,12 +1686,21 @@ def run_project(project, progress=None, cancel=None):
                source))
     result["files_found"] = len(files)
     report("scan", len(files), len(files), "Found %d email files" % len(files))
+    loose_files = []
+    if docs_folder:
+        loose_files = _scan_documents_folder(docs_folder, project, out_dir, cancel, report,
+                                             result["doc_problems"])
+        if loose_files is None or _is_cancelled(cancel):
+            return _cancelled_result(result, started)
     timings["scan"] = time.time() - t0
 
-    # 2. Read (or take from the cache).
+    # 2. Read (or take from the cache). Attached documents are condensed as each
+    # email is read, so their bytes are never all held at once.
     t0 = time.time()
     cache_file = cache_path(project)
     old_cache = load_cache(cache_file)
+    store = _DocStore(docs_cache_path(project)) if (want_attachments or docs_folder) else None
+    read_store = store if want_attachments else None
     new_cache = {}
     records = []
     failed = []
@@ -1019,7 +1713,7 @@ def run_project(project, progress=None, cancel=None):
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         futures = []
         for p in files:
-            future = pool.submit(_read_one, p, old_cache.get(p), listed.get(p))
+            future = pool.submit(_read_one, p, old_cache.get(p), listed.get(p), read_store, cancel)
             future.add_done_callback(finished.put)
             futures.append(future)
         while done < total:
@@ -1051,13 +1745,14 @@ def run_project(project, progress=None, cancel=None):
     timings["read"] = time.time() - t0
     cancelled = cancelled or _is_cancelled(cancel)
 
-    # Save the cache (also when cancelled, so the next run doesn't start again).
+    # Save the caches (also when cancelled, so the next run doesn't start again).
     merged = _merged_cache(old_cache, new_cache, files, not scan_errors)
     if result["files_read"] or (not cancelled and set(old_cache) != set(merged)):
         if not save_cache(cache_file, merged):
             notes.append("The read cache could not be saved, so the next run will read "
                          "every email again.")
     if cancelled:
+        _save_doc_store(store, notes)
         return _cancelled_result(result, started)
     failed.sort(key=lambda item: item[0].lower())
     result["failed"] = scan_errors + failed
@@ -1066,6 +1761,7 @@ def run_project(project, progress=None, cancel=None):
     reason = _incomplete_reason(source, files, records, scan_errors, failed, out_of_reach,
                                 old_cache)
     if reason:
+        _save_doc_store(store, notes)
         message = _stopped_message(
             reason, had_previous=bool(old_cache),
             damaged_only=(out_of_reach == 0 and not scan_errors and bool(failed)))
@@ -1087,54 +1783,114 @@ def run_project(project, progress=None, cancel=None):
                      "hiccup), run it again - those emails are still remembered, so it will "
                      "be quick." % (item[0], _plural(had, "email")))
 
-    # 3. Filter by date and build the digest.
-    t0 = time.time()
+    # Filter by date (attachments go with their email; loose files are not dated).
     records.sort(key=lambda r: r.get("path", "").lower())
     kept, outside = [], []
     for r in records:
         (kept if in_date_range(r, date_from, date_to) else outside).append(r)
+
+    # 3. Documents: condense the loose files, then put every document in order
+    # of first appearance and number it (D1, D2 ...).
+    found = []
+    if store is not None:
+        t0 = time.time()
+        loose = _read_loose_documents(loose_files, store, cancel, report)
+        if loose is None or _is_cancelled(cancel):
+            _save_doc_store(store, notes)
+            return _cancelled_result(result, started)
+        found = _collect_documents(kept if want_attachments else [], loose, store)
+        store.mark_used(_used_sha1s(records if want_attachments else [], loose))
+        _save_doc_store(store, notes)
+        report("documents", 1, 1, "Found %s" % _plural(len(found), "document"))
+        timings["documents"] = time.time() - t0
+        doc_line = ("Documents: %d found (%d condensed this run; the others came from the "
+                    "documents cache or are file types that are only listed)"
+                    % (len(found), store.extracted))
+    else:
+        doc_line = ""
+
+    # 4. Build the email digest (attachments marked with their document IDs).
+    t0 = time.time()
     report("digest", 0, 1, "Squishing %d emails..." % len(kept))
     # Email files that couldn't be read (not folders: those are in scan_errors).
     unreadable = len(failed)
-    digest = _make_digest(kept, project, source, outside, cancel, report, no_access, unreadable)
+    doc_ids = _doc_ids(found)
+    digest = _make_digest(kept, project, source, outside, cancel, report, no_access, unreadable,
+                          doc_ids)
     if digest is None or _is_cancelled(cancel):
         return _cancelled_result(result, started)
+
+    # 5. Build the documents digest.
+    shown_docs, doc_parts, doc_stats = [], [], {}
+    if found:
+        emails_used = (digest.get("stats") or {}).get("emails_used")
+        email_parts = (digest.get("parts") or []) if emails_used else []
+        shown_docs = _focus_documents(found, keywords, email_parts)
+        if any(d["id"] for d in shown_docs):
+            # (A list of files whose contents couldn't be read is not worth a digest.)
+            report("digest", 0, 1, "Squishing %s..." % _plural(len(shown_docs), "document"))
+            doc_digest = _make_documents_digest(
+                shown_docs, digest.get("aliases") or {}, project,
+                _documents_source_label(source, want_attachments, docs_folder), notes)
+            if _is_cancelled(cancel):
+                return _cancelled_result(result, started)
+            if doc_digest is not None:
+                doc_parts = doc_digest.get("parts") or []
+                doc_stats = doc_digest.get("stats") or {}
+        if doc_ids and not doc_parts:
+            # The email digest must not point at a documents digest that isn't written.
+            digest = _make_digest(kept, project, source, outside, cancel, report, no_access,
+                                  unreadable)
+            if digest is None or _is_cancelled(cancel):
+                return _cancelled_result(result, started)
     report("digest", 1, 1, "Digest ready")
     timings["digest"] = time.time() - t0
     stats = dict(digest.get("stats") or {})
     stats["outside_dates"] = len(outside)
     stats["no_access_emails"] = no_access
     stats["unreadable_files"] = unreadable
+    stats.update(_document_stats(shown_docs if doc_parts else [], doc_stats))
     result["stats"] = stats
+    result["doc_problems"].extend(_document_problems(shown_docs))
 
-    # 4. Write the parts, then remove the older digest files they replace.
+    # 6. Write the parts (emails and documents in one all-or-nothing swap), then
+    # remove the older digest files they replace.
     t0 = time.time()
     parts = digest.get("parts") or []
     removed, remove_errors = [], []
     if not stats.get("emails_used"):
-        # Nothing survived the date / keyword filters: write nothing and keep the
-        # previous digest files instead of replacing them with an empty header.
+        # Nothing survived the date / keyword filters: write no email digest and
+        # keep the previous files instead of replacing them with an empty header.
         parts = []
         notes.append("No emails were left after the date and focus keyword filters, so no "
-                     "digest was written and the earlier digest files were kept.")
-    if parts:
-        names = output_filenames(name, parts, focus_label(keywords), out_dir,
-                                 dates=date_label(date_from, date_to))
-        written = _write_parts(out_dir, parts, names, report, cancel)
+                     "email digest was written and the earlier digest files were kept.")
+    focus = focus_label(keywords)
+    dates = date_label(date_from, date_to)
+    names = output_filenames(name, parts, focus, out_dir, dates=dates) if parts else []
+    doc_names = (output_filenames(name, doc_parts, focus, out_dir, dates=dates, kind=KIND_DOCUMENTS)
+                 if doc_parts else [])
+    if parts or doc_parts:
+        kinds = [KIND_EMAILS] * len(parts) + [KIND_DOCUMENTS] * len(doc_parts)
+        written = _write_parts(out_dir, parts + doc_parts, names + doc_names, report, cancel, kinds)
         if written is None:
             return _cancelled_result(result, started)
         result["files"] = written
-        removed, remove_errors = _remove_older_outputs(
-            project, out_dir, names, filter_key(date_from, date_to, keywords))
+        key = filter_key(date_from, date_to, keywords)
+        for kind, kind_names in ((KIND_EMAILS, names), (KIND_DOCUMENTS, doc_names)):
+            if kind_names:
+                gone, errors = _remove_older_outputs(project, out_dir, kind_names, key, kind)
+                removed.extend(gone)
+                remove_errors.extend(errors)
     timings["write"] = time.time() - t0
 
     _finish(result, started)
     result["log_path"] = _write_log(project, result, timings, removed, remove_errors,
-                                    date_from, date_to, notes)
+                                    date_from, date_to, notes, doc_line)
     return result
 
 
-def _write_log(project, result, timings, removed, remove_errors, date_from, date_to, notes=()):
+def _write_log(project, result, timings, removed, remove_errors, date_from, date_to, notes=(),
+               doc_line=""):
     """Write '<project> - last run.txt' in the logs folder; returns its path ('' on failure)."""
     name = project_name(project)
     log_path = paths.logs_dir() / ("%s - last run.txt" % paths.safe_filename(name))
@@ -1145,6 +1901,8 @@ def _write_log(project, result, timings, removed, remove_errors, date_from, date
     stats = result.get("stats") or {}
     folder_problems = [f for f in result["failed"] if is_folder_problem(f[1])]
     file_problems = [f for f in result["failed"] if not is_folder_problem(f[1])]
+    docs_on = bool(project.get("docs_from_attachments", True)) or bool(
+        paths.clean_folder_text(project.get("docs_folder")))
     lines = [
         "Squish run log",
         "Project: %s" % name,
@@ -1158,11 +1916,25 @@ def _write_log(project, result, timings, removed, remove_errors, date_from, date
         % (project.get("squeeze", "standard"), project.get("part_size", "medium"),
            yes_no(project.get("drop_noise", True)), yes_no(project.get("recover_quoted", True))),
         "Focus keywords: %s" % (_one_line(project.get("focus_keywords")) or "(none)"),
+    ]
+    if docs_on:
+        folder = paths.clean_folder_text(project.get("docs_folder"))
+        if folder:
+            folder += " (include subfolders: %s)" % yes_no(project.get("docs_include_subfolders",
+                                                                       True))
+        lines.append("Documents: attachments %s | folder: %s | %s"
+                     % (yes_no(project.get("docs_from_attachments", True)), folder or "(none)",
+                        docs.backend_status()))
+    lines += [
         "",
         "Files found: %d | read: %d | from cache: %d | could not read: %d"
         % (result["files_found"], result["files_read"], result["from_cache"], len(file_problems)),
         "Times: " + ", ".join("%s %.1f s" % (k, v) for k, v in timings.items())
         + ", total %.1f s" % result["elapsed_s"],
+    ]
+    if doc_line:
+        lines.append(doc_line)
+    lines += [
         "",
         "Digest: " + ", ".join("%s %s" % (k.replace("_", " "), v) for k, v in sorted(stats.items())),
     ]
@@ -1172,6 +1944,11 @@ def _write_log(project, result, timings, removed, remove_errors, date_from, date
     lines.append("")
     lines.append("Files written (%d):" % len(result["files"]))
     for f in result["files"]:
+        if f.get("kind") == KIND_DOCUMENTS:
+            lines.append("  %s | %d chars | ~%d tokens | %s to %s | %d documents"
+                         % (os.path.basename(f["path"]), f["chars"], f["est_tokens"],
+                            f["first_date"] or "?", f["last_date"] or "?", f.get("documents", 0)))
+            continue
         lines.append("  %s | %d chars | ~%d tokens | %s to %s | %d emails, %d threads"
                      % (os.path.basename(f["path"]), f["chars"], f["est_tokens"],
                         f["first_date"] or "?", f["last_date"] or "?", f["emails"], f["threads"]))
@@ -1194,6 +1971,13 @@ def _write_log(project, result, timings, removed, remove_errors, date_from, date
     for path, error in file_problems:
         lines.append("  %s" % path)
         lines.append("      %s" % error)
+    doc_problems = result.get("doc_problems") or []
+    if docs_on or doc_problems:
+        lines.append("")
+        lines.append("Documents that could not be read (%d):" % len(doc_problems))
+        for where, error in doc_problems:
+            lines.append("  %s" % where)
+            lines.append("      %s" % error)
     try:
         _write_text_atomic(str(log_path), "\n".join(lines) + "\n")
     except OSError:

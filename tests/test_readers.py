@@ -1,5 +1,6 @@
 """Tests for readers.py: HTML to text, .eml reading and .msg reading (synthetic files)."""
 
+import hashlib
 import json
 import os
 import re
@@ -9,6 +10,8 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
+
+from email.message import EmailMessage
 
 from squish_app import readers
 from tests import msg_builder as mb
@@ -1035,6 +1038,172 @@ class EightBitMsgTests(TempDirMixin, unittest.TestCase):
             rec = readers.read_email(path)
         self.assertEqual(rec["reader"], "extract_msg")
         self.assertEqual(calls, [False, True])
+
+
+# --------------------------------------------------------------------------
+# Documents (v1.1): read_email(path, want_docs=True)
+# --------------------------------------------------------------------------
+
+REPORT = b"%PDF-1.4 synthetic geotechnical report"
+CALC = b"PK synthetic calc workbook"
+DOC_KEYS = ("_data", "sha1", "doc_size")
+
+
+def eml_with_documents():
+    """An .eml with two documents, a photo, an old .doc, an inline logo and an
+    attached email that carries its own PDF."""
+    inner = EmailMessage()
+    inner["From"] = "Pat Client <pat@client.example>"
+    inner["Subject"] = "RE: Variation 3"
+    inner["Date"] = "Fri, 02 May 2025 13:04:00 +1000"
+    inner.set_content("Approved.")
+    inner.add_attachment(b"%PDF inner", maintype="application", subtype="pdf",
+                         filename="inner approval.pdf")
+    msg = EmailMessage()
+    msg["From"] = "Sam Sample <sam@example.org>"
+    msg["To"] = "Alex Example <alex@example.com>"
+    msg["Subject"] = "Reports"
+    msg["Date"] = "Mon, 05 May 2025 09:00:00 +1000"
+    msg.set_content("Reports attached.")
+    msg.add_alternative('<p>Reports attached.</p><img src="cid:logo@x">', subtype="html")
+    msg.get_payload()[1].add_related(b"\x89PNG logo", maintype="image", subtype="png",
+                                     cid="<logo@x>", filename="logo.png")
+    msg.add_attachment(REPORT, maintype="application", subtype="pdf", filename="Geotech report.pdf")
+    msg.add_attachment(CALC, maintype="application", subtype="octet-stream", filename="Calc.xlsx")
+    msg.add_attachment(b"\xff\xd8 photo", maintype="image", subtype="jpeg", filename="IMG_0001.jpg")
+    msg.add_attachment(b"\xd0\xcf old", maintype="application", subtype="msword",
+                       filename="Old spec.doc")
+    msg.attach(_rfc822_part(inner))
+    return msg.as_bytes()
+
+
+def _rfc822_part(inner):
+    part = EmailMessage()
+    part.set_content(inner)
+    return part
+
+
+def msg_with_documents(**overrides):
+    inner = mb.message_tree(subject="RE: Variation 3", body="Approved.", embedded=True,
+                            sender_name="Pat Client", sender_smtp="pat@client.example",
+                            attachments=[{"long_name": "inner approval.pdf", "data": b"%PDF inner"}])
+    kwargs = dict(
+        subject="Reports", body="Reports attached.\r\n", sender_name="Sam Sample",
+        sender_smtp="sam@example.org", submit_time=datetime(2025, 5, 4, 23, 0, tzinfo=UTC),
+        attachments=[
+            mb.file_attachment("Geotech report.pdf", REPORT, "application/pdf"),
+            mb.file_attachment("Calc.xlsx", CALC),
+            {"long_name": "image001.png", "data": b"\x89PNG", "hidden": True},
+            {"long_name": "Old spec.doc", "data": b"\xd0\xcf old"},
+            {"display_name": "RE: Variation 3", "embedded": inner},
+        ])
+    kwargs.update(overrides)
+    return mb.build_msg(**kwargs)
+
+
+class DocumentAttachmentTests(TempDirMixin, unittest.TestCase):
+
+    def read_builtin(self, path, **kwargs):
+        with mock.patch.dict(os.environ, {"SQUISH_NO_EXTRACT_MSG": "1"}):
+            return readers.read_email(path, **kwargs)
+
+    def check_documents(self, rec):
+        atts = dict((a["name"], a) for a in rec["attachments"])
+        for name, data in (("Geotech report.pdf", REPORT), ("Calc.xlsx", CALC)):
+            self.assertEqual(atts[name]["_data"], data)
+            self.assertEqual(atts[name]["sha1"], hashlib.sha1(data).hexdigest())
+            self.assertEqual(atts[name]["doc_size"], len(data))
+        others = [n for n in atts if n not in ("Geotech report.pdf", "Calc.xlsx")]
+        self.assertIn("Old spec.doc", others)
+        self.assertGreaterEqual(len(others), 3)
+        for name in others:     # photo / inline image, old .doc, attached email
+            for key in DOC_KEYS + ("data",):
+                self.assertNotIn(key, atts[name], name)
+        attached = [a for a in rec["attachments"] if a["email"]]
+        self.assertEqual(len(attached), 1)
+        self.assertEqual(attached[0]["email"]["sender_name"], "Pat Client")
+        self.assertNotIn("attachments", attached[0]["email"])   # one level only
+
+    def check_no_documents(self, rec):
+        self.assertEqual(set(rec), RECORD_KEYS)
+        for att in rec["attachments"]:
+            self.assertEqual(set(att), set(["name", "size", "inline", "email"]), att["name"])
+        self.assertEqual(json.loads(json.dumps(rec)), rec)
+
+    def test_eml_keeps_document_bytes_only_when_asked(self):
+        path = self.write("docs.eml", eml_with_documents())
+        plain = readers.read_email(path)
+        self.check_no_documents(plain)
+        rec = readers.read_email(path, want_docs=True)
+        self.check_documents(rec)
+        # Apart from the document keys the record is the same.
+        for att in rec["attachments"]:
+            for key in DOC_KEYS:
+                att.pop(key, None)
+        self.assertEqual(rec, plain)
+
+    def test_builtin_msg_keeps_document_bytes_only_when_asked(self):
+        path = self.write("docs.msg", msg_with_documents())
+        plain = self.read_builtin(path)
+        self.check_no_documents(plain)
+        rec = self.read_builtin(path, want_docs=True)
+        self.assertEqual(rec["reader"], "builtin_msg")
+        self.check_documents(rec)
+
+    def test_extract_msg_reader_agrees(self):
+        if not extract_msg_installed():
+            self.skipTest("extract-msg is not installed")
+        path = self.write("docs.msg", msg_with_documents())
+        with mock.patch.dict(os.environ, {"SQUISH_NO_EXTRACT_MSG": ""}):
+            readers._extract_msg_state["checked"] = False
+            rec = readers.read_email(path, want_docs=True)
+            plain = readers.read_email(path)
+        self.assertEqual(rec["reader"], "extract_msg")
+        self.check_documents(rec)
+        self.check_no_documents(plain)
+        builtin = self.read_builtin(path, want_docs=True)
+        rec.pop("reader")
+        builtin.pop("reader")
+        self.assertEqual(rec, builtin)
+
+    def test_big_msg_documents_come_from_the_builtin_reader(self):
+        data = msg_with_documents(attachments=[
+            {"long_name": "C-101.dwg", "data": b"d" * 3000000},
+            {"long_name": "Geotech report.pdf", "data": REPORT}])
+        path = self.write("big.msg", data)
+        rec = readers.read_email(path, want_docs=True)
+        self.assertEqual(rec["reader"], "builtin_msg")
+        dwg, report = rec["attachments"]
+        self.assertNotIn("_data", dwg)
+        self.assertEqual(report["_data"], REPORT)
+
+    def test_documents_over_the_size_limit_are_not_kept(self):
+        path = self.write("docs.eml", eml_with_documents())
+        with mock.patch.object(readers.docs, "DOC_MAX_BYTES", 30):
+            rec = readers.read_email(path, want_docs=True)
+            self.assertTrue(readers.wants_doc_data("Report.PDF", 30))
+            self.assertFalse(readers.wants_doc_data("Report.pdf", 31))
+        atts = dict((a["name"], a) for a in rec["attachments"])
+        self.assertNotIn("_data", atts["Geotech report.pdf"])     # 38 bytes
+        self.assertEqual(atts["Calc.xlsx"]["doc_size"], len(CALC))  # 26 bytes
+        self.assertFalse(readers.wants_doc_data("photo.jpg", 3))
+        self.assertFalse(readers.wants_doc_data("Report.pdf", None))
+
+    def test_signed_msg_documents_come_from_the_mime(self):
+        data = mb.build_msg(subject="Levels", message_class="IPM.Note.SMIME.MultipartSigned",
+                            sender_name="Sam Sample", sender_smtp="sam@example.org",
+                            submit_time=datetime(2025, 3, 1, tzinfo=UTC),
+                            attachments=[{"long_name": "smime.p7m", "mime": "multipart/signed",
+                                          "data": SIGNED_MIME}])
+        path = self.write("signed.msg", data)
+        plain = self.read_builtin(path)
+        self.check_no_documents(plain)    # the S/MIME container's bytes never stay in a record
+        rec = self.read_builtin(path, want_docs=True)
+        visible = [a for a in rec["attachments"] if not a["inline"]]
+        self.assertEqual([a["name"] for a in visible], ["levels.pdf"])
+        self.assertEqual(visible[0]["_data"], b"%PDF-1.4\n")
+        for att in rec["attachments"]:
+            self.assertNotIn("data", att)
 
 
 class SurrogateTests(unittest.TestCase):

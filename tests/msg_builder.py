@@ -239,6 +239,11 @@ def message_tree(subject="", body=None, html=None, rtf_compressed=None,
     recipients: [(name, smtp, email_address, type)] (type 1 To, 2 Cc, 3 Bcc)
     attachments: [{"long_name", "short_name", "display_name", "data", "content_id",
                    "mime", "hidden", "flags", "size", "embedded": message_tree(...)}]
+                 "data" is the attachment's bytes, written as its data stream
+                 (__substg1.0_37010102; 4096 bytes or more go in regular sectors);
+                 "size" is PR_ATTACH_SIZE (left out unless given). file_attachment()
+                 makes one the way Outlook does. An "embedded" message may have
+                 attachments of its own.
     start_date / end_date: PR_START_DATE / PR_END_DATE (aware datetimes)
     named: [(property set uuid, numeric name, "time" | "string", value)] named
            properties; they get the ids 0x8000, 0x8001, ... in that order.
@@ -337,6 +342,18 @@ def message_tree(subject="", body=None, html=None, rtf_compressed=None,
             "__substg1.0_00040102": b"",
         }
     return tree
+
+
+def file_attachment(name, data, mime=None, **extra):
+    """An attachments entry for a file, as Outlook writes one: long and short
+    (8.3) names, the display name, a MIME type and PR_ATTACH_SIZE, which is the
+    size of the whole attachment object (a little more than the data)."""
+    base, dot, ext = name.rpartition(".")
+    short = (base or ext)[:6].upper().replace(" ", "_") + "~1" + ("." + ext[:3].upper() if dot else "")
+    entry = {"long_name": name, "short_name": short, "display_name": name, "data": data,
+             "mime": mime or "application/octet-stream", "size": len(data) + 312}
+    entry.update(extra)
+    return entry
 
 
 def build_msg(**kwargs):

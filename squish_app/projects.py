@@ -41,8 +41,10 @@ SQUEEZE_CHOICES = ("light", "standard", "max")
 PART_SIZE_CHOICES = ("small", "medium", "large", "single")
 
 _TEXT_KEYS = ("name", "source_folder", "output_folder", "date_from", "date_to",
-              "focus_keywords", "org_codes")
-_BOOL_KEYS = ("include_subfolders", "drop_noise", "recover_quoted")
+              "focus_keywords", "org_codes", "docs_folder")
+_BOOL_KEYS = ("include_subfolders", "drop_noise", "recover_quoted",
+              "docs_from_attachments", "docs_include_subfolders")
+_FOLDER_KEYS = ("source_folder", "output_folder", "docs_folder")
 
 
 def default_settings():
@@ -61,6 +63,11 @@ def default_settings():
         "org_codes": DEFAULT_ORG_CODES,
         "drop_noise": True,
         "recover_quoted": True,
+        # Documents (v1.1): condense attached documents, and optionally a folder
+        # of loose documents, into a separate documents digest.
+        "docs_from_attachments": True,
+        "docs_folder": "",
+        "docs_include_subfolders": True,
         "last_run": None,
     }
 
@@ -89,7 +96,7 @@ def normalise_project(raw):
     for key in _TEXT_KEYS:
         value = project.get(key)
         project[key] = "" if value is None else str(value)
-    for key in ("source_folder", "output_folder"):
+    for key in _FOLDER_KEYS:
         project[key] = paths.clean_folder_text(project[key])
     for key in _BOOL_KEYS:
         value = project.get(key)
@@ -313,6 +320,12 @@ def last_run_from_result(result):
     failed = result.get("failed") or []
     saved["failed_count"] = len(failed)        # files and folders
     saved["failed_folders"] = sum(1 for item in failed if engine.is_folder_problem(item[1]))
+    # Documents that couldn't be read, and documents folders that couldn't be
+    # opened (counts only, like the failed list).
+    doc_problems = result.get("doc_problems") or []
+    saved["doc_problem_count"] = len(doc_problems)
+    saved["doc_problem_folders"] = sum(1 for item in doc_problems
+                                       if engine.is_doc_folder_problem(item[1]))
     return saved
 
 

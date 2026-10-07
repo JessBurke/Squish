@@ -43,6 +43,10 @@ class NewProjectTests(ProjectsTestCase):
         self.assertTrue(p["drop_noise"])
         self.assertTrue(p["recover_quoted"])
         self.assertIsNone(p["last_run"])
+        # Documents (v1.1): attachments on, no documents folder
+        self.assertIs(p["docs_from_attachments"], True)
+        self.assertEqual(p["docs_folder"], "")
+        self.assertIs(p["docs_include_subfolders"], True)
 
     def test_ids_are_unique(self):
         ids = set(projects.new_project("x")["id"] for _ in range(50))
@@ -109,6 +113,35 @@ class LoadSaveTests(ProjectsTestCase):
         self.assertTrue(p["recover_quoted"])
         self.assertIsNone(p["last_run"])
 
+    def test_projects_saved_before_documents_get_the_document_settings(self):
+        # A projects.json written by Squish 1.0 has no document settings.
+        self.write_file(json.dumps({"version": 1, "projects": [{
+            "id": "v10", "name": "Riverside Depot", "source_folder": "H:\\Jobs\\01 Emails",
+            "include_subfolders": False, "output_folder": "", "date_from": "", "date_to": "",
+            "squeeze": "max", "part_size": "small", "focus_keywords": "", "drop_noise": True,
+            "recover_quoted": True, "org_codes": "example.com=EX",
+            "last_run": {"finished_at": "2026-01-02 10:00", "failed_count": 0,
+                         "files": [{"path": "H:\\Out\\Squish - Riverside Depot - undated.txt",
+                                    "est_tokens": 9}]}}]}))
+        (p,) = projects.load_projects()
+        self.assertIs(p["docs_from_attachments"], True)
+        self.assertEqual(p["docs_folder"], "")
+        self.assertIs(p["docs_include_subfolders"], True)
+        # ... and keeps everything it had
+        self.assertEqual((p["squeeze"], p["part_size"]), ("max", "small"))
+        self.assertIs(p["include_subfolders"], False)
+        self.assertEqual(p["last_run"]["files"][0]["est_tokens"], 9)
+        projects.save_projects([p])
+        self.assertEqual(projects.load_projects(), [p])
+
+    def test_document_settings_round_trip(self):
+        a = projects.new_project("Harbour Road")
+        a["docs_from_attachments"] = False
+        a["docs_folder"] = "H:\\Jobs\\Harbour Road\\04 Reports"
+        a["docs_include_subfolders"] = False
+        projects.save_projects([a])
+        self.assertEqual(projects.load_projects(), [a])
+
     def test_bare_list_file_is_accepted(self):
         self.write_file(json.dumps([{"id": "x1", "name": "Listed"}]))
         self.assertEqual([p["name"] for p in projects.load_projects()], ["Listed"])
@@ -116,8 +149,12 @@ class LoadSaveTests(ProjectsTestCase):
     def test_bad_values_are_corrected(self):
         self.write_file(json.dumps({"projects": [{
             "name": None, "squeeze": "extreme", "part_size": 12, "drop_noise": 0,
-            "include_subfolders": None, "last_run": "yesterday", "focus_keywords": None}]}))
+            "include_subfolders": None, "last_run": "yesterday", "focus_keywords": None,
+            "docs_from_attachments": 0, "docs_folder": None, "docs_include_subfolders": None}]}))
         (p,) = projects.load_projects()
+        self.assertIs(p["docs_from_attachments"], False)
+        self.assertEqual(p["docs_folder"], "")
+        self.assertIs(p["docs_include_subfolders"], True)
         self.assertEqual(p["name"], projects.DEFAULT_NAME)
         self.assertEqual(len(p["id"]), 32)
         self.assertEqual(p["squeeze"], "standard")
@@ -242,9 +279,11 @@ class NormaliseTests(ProjectsTestCase):
     def test_folder_quotes_are_removed(self):
         p = projects.normalise_project({"id": "q", "name": "Q",
                                         "source_folder": '"H:\\Jobs\\01 Emails"',
-                                        "output_folder": ' "D:\\Out" '})
+                                        "output_folder": ' "D:\\Out" ',
+                                        "docs_folder": '"H:\\Jobs\\04 Reports"'})
         self.assertEqual(p["source_folder"], "H:\\Jobs\\01 Emails")
         self.assertEqual(p["output_folder"], "D:\\Out")
+        self.assertEqual(p["docs_folder"], "H:\\Jobs\\04 Reports")
 
 
 class SameFileNameTests(unittest.TestCase):
@@ -388,6 +427,18 @@ class LastRunTests(ProjectsTestCase):
         self.assertEqual(saved["files"], self.RESULT["files"])
         saved["files"][0]["path"] = "changed"           # a copy, not the result itself
         self.assertEqual(self.RESULT["files"][0]["path"], "/out/Squish - A - undated.txt")
+
+    def test_last_run_counts_document_problems(self):
+        result = dict(self.RESULT, doc_problems=[
+            ["Old scan.pdf (attached to /x.msg)", "no text (a scanned PDF?)"],
+            ["/docs/locked.docx", "password protected"],
+            ["/docs/Reports", "documents folder not found: check the VPN"]])
+        saved = projects.last_run_from_result(result)
+        self.assertEqual((saved["doc_problem_count"], saved["doc_problem_folders"]), (3, 1))
+        self.assertNotIn("doc_problems", saved)
+        # A run without documents (or from an engine without them) counts none.
+        saved = projects.last_run_from_result(self.RESULT)
+        self.assertEqual((saved["doc_problem_count"], saved["doc_problem_folders"]), (0, 0))
 
     def test_record_last_run_saves_it(self):
         a, b = projects.new_project("A"), projects.new_project("B")

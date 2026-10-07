@@ -66,14 +66,23 @@ LONG_PATH_ADVICE = ("This file's full path is too long for Windows Explorer - us
                     "or pick a shorter 'Save digests to' folder.")
 ONE_CHAT_TOKENS = 150000  # several files this small together still fit in one Claude chat
 EXPLORER_PATH_LIMIT = 260  # File Explorer and drag-and-drop can't handle longer paths
+MANY_DOCUMENTS = 500       # more documents than this in the folder: say the first run takes a while
+# The documents Squish reads (docs.SUPPORTED_EXT); used only if docs.py can't be loaded.
+DOCUMENT_EXT = (".csv", ".docm", ".docx", ".dotx", ".md", ".pdf", ".pptx", ".rtf", ".txt",
+                ".xlsm", ".xlsx", ".zip")
+PDF_CHECKING = "checking..."
+PDF_ADVICE = ("PDFs are read with Squish's built-in reader. For better results, run Install "
+              "Squish.bat again or ask IT to install the pypdf package." if IS_WINDOWS else
+              "PDFs are read with Squish's built-in reader. For better results, install the "
+              "pypdf package (pip install pypdf).")
 
 DEFAULT_NAME_RE = re.compile(r"^%s( \d+)?$" % re.escape(projects.DEFAULT_NAME), re.I)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # The ' (only <dates>)' tag a dated run adds to its file names (see engine.output_filenames)
 DATES_TAG = (r" \(only (?:\d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}|from \d{4}-\d{2}-\d{2}"
              r"|up to \d{4}-\d{2}-\d{2})\)")
-OUTPUT_NAME_RE = re.compile(  # see engine.output_filenames
-    r"^Squish - .+? - (?=(\d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}|undated)"
+OUTPUT_NAME_RE = re.compile(  # see engine.output_filenames ('documents - ' is kept)
+    r"^Squish - .+? - (?=(documents - )?(\d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}|undated)"
     r"(%s)?( \(focus[^()]*\))?( \(part \d+ of \d+\))?\.txt$)" % DATES_TAG, re.I)
 GENERIC_FOLDER_RE = paths.GENERIC_FOLDER_RE  # '01 Emails', 'Correspondence' ...
 
@@ -91,7 +100,8 @@ HOW_TO = """How to use Squish
 3. Squish!
    Click Squish! (or press F5). Squish reads every email, cuts out quoted
    history, signatures and disclaimers, and writes one compact text file
-   (or a few, if there is a lot of email).
+   (or a few, if there is a lot of email) - plus a documents file, see
+   Documents below.
 
 4. Give it to Claude
    Click "Show in folder" and drag the file into Claude, or click
@@ -101,6 +111,23 @@ HOW_TO = """How to use Squish
    covers). Then ask, e.g.:
      "List every open action or request, who owes it, and since when."
      "Summarise what was agreed about <topic>, with dates."
+
+Documents (Word, Excel, PowerPoint and PDF files)
+   Squish also condenses the documents attached to the emails, and - if
+   you choose one on the Documents tab - the documents in a folder, such
+   as the project's Reports folder. They go into a separate file whose
+   name has "documents" in it, so the emails file stays small. Long
+   documents keep their headings and the sentences and table rows with
+   figures, dates and requirements; a later version of a document shows
+   only what changed. Drawings are listed with their title and revision.
+   Drag in the emails file first; add the documents file when you need
+   what the attachments say, e.g.:
+     "Using the emails and documents digests, list every requirement in
+      the geotech report and whether the emails show it was addressed."
+   Not read (listed by name only): old .doc, .xls and .ppt files (save
+   them as .docx, .xlsx or .pptx), scanned PDFs without text, and CAD
+   files. Of a drawing, only the title block is read.
+   Untick the box on the Documents tab to leave attachments out.
 
 Tips
  - Only need a period? Fill in the From / To dates (Emails tab), or point
@@ -247,6 +274,112 @@ def count_email_files(folder, include_subfolders, stop, report, skipped=None):
     return count
 
 
+def is_document_name(name):
+    """True for a file Squish can condense (Word, Excel, PowerPoint, PDF, text, zip)."""
+    try:
+        from . import docs
+        return docs.is_supported(name)
+    except Exception:       # (the documents code couldn't be loaded)
+        return os.path.splitext(name)[1].lower() in DOCUMENT_EXT
+
+
+def count_document_files(folder, include_subfolders, stop, report, skipped=None, skip_folder=""):
+    """Count the files in a documents folder: (documents, other files).
+
+    Uses the same rules as a run (engine.scan_documents: email files, Squish's
+    own digest files, hidden files and ``skip_folder`` - the output folder - are
+    left out). "Documents" are the files Squish condenses; "other files" are
+    only listed by name. Calls report(files so far) now and then. Returns None
+    if ``stop`` was set. Raises OSError if the folder itself can't be opened;
+    subfolders that can't be opened are added to ``skipped``, if given. Runs in
+    a background thread (no tkinter here).
+    """
+    if not os.path.isdir(paths.long_path(folder)):
+        raise FileNotFoundError(folder)
+    from . import engine
+    errors = []
+    last = [time.monotonic()]
+
+    def progress(_stage, done, _total, _message):
+        if time.monotonic() - last[0] > 0.3:
+            report(done)
+            last[0] = time.monotonic()
+
+    found = engine.scan_documents(folder, include_subfolders, skip_folder, cancel=stop,
+                                  progress=progress, errors=errors)
+    if found is None or stop.is_set():
+        return None
+    top = paths.short_path(paths.long_path(folder))    # as scan_documents names it
+    for where, message in errors:
+        if where == top:
+            raise OSError(message.split(": ", 1)[-1])   # (without 'folder could not be opened: ')
+        if skipped is not None:
+            skipped.append(where)
+    documents = sum(1 for path, _mtime, _size in found if is_document_name(os.path.basename(path)))
+    return documents, len(found) - documents
+
+
+def docs_folder_problem(docs_folder, out_dir):
+    """A message when the documents folder is the output folder or inside it, else ''.
+    (Compared as typed only, like output_folder_problem.)"""
+    from . import engine
+    if engine.output_inside_source(out_dir, docs_folder, resolve_links=False):
+        return ("This is where the digests are saved, so Squish won't read documents from it. "
+                "Choose the folder that holds the project's documents.")
+    return ""
+
+
+def docs_count_text(documents, others, skipped, subfolders):
+    """(text, hint style) for the documents folder's file count. ``skipped``:
+    subfolders that couldn't be opened; ``subfolders``: Include subfolders."""
+    not_opened = (" (%s couldn't be opened)" % plural(skipped, "subfolder")) if skipped else ""
+    if documents:
+        text = "%s found (%s)%s" % (plural(documents, "document"),
+                                    "incl. subfolders" if subfolders else "this folder only",
+                                    not_opened)
+        if others:
+            text += " - plus %s, listed by name only" % plural(others, "other file")
+        text += "."
+        many = documents > MANY_DOCUMENTS
+        if many:
+            text += (" The first run reads them all, which takes a while; a smaller folder "
+                     "(e.g. Reports) is quicker.")
+        return text, "Warn" if skipped or many else "Good"
+    if others:
+        text = ("No Word, Excel, PowerPoint, PDF or text files here%s - just %s, which will be "
+                "listed by name." % (not_opened, plural(others, "other file")))
+    else:
+        text = "No files here%s." % not_opened
+    if not subfolders:
+        text += " Tick 'Include subfolders' to look inside its folders."
+    return text, "Warn"
+
+
+def file_kind(f):
+    """'documents' for a documents digest file, else 'emails' (files from before
+    v1.1 have no kind: they are all email digests)."""
+    return "documents" if f.get("kind") == "documents" else "emails"
+
+
+def the_files(n, kind):
+    """'the emails file' / 'the documents files' ..."""
+    return "the %s file%s" % (kind, "" if n == 1 else "s")
+
+
+def kind_counts(files):
+    """(number of emails files, number of documents files)."""
+    documents = sum(1 for f in files if file_kind(f) == "documents")
+    return len(files) - documents, documents
+
+
+def docs_first(files):
+    """'the emails file first; add the documents file when you need what the
+    attachments say', with plurals to match ``files``."""
+    emails, documents = kind_counts(files)
+    return ("%s first; add %s when you need what the attachments say"
+            % (the_files(emails, "emails"), the_files(documents, "documents")))
+
+
 def fit_one_chat(files, part_size=None):
     """True if these digest files together are small enough for one Claude chat.
 
@@ -267,10 +400,18 @@ def done_message(elapsed_s, files, can_copy, other_project="", filters="", part_
     ``part_size`` is the run's File size setting (see fit_one_chat).
     """
     text = "Done in %.0f s - " % (elapsed_s or 0)
+    mixed = all(kind_counts(files))     # both emails and documents files
     if len(files) == 1:
         text += "1 file ready. Click Show in folder and drag it into Claude"
         if can_copy and not (other_project or filters):
             text += " (or Copy file, then %s)" % PASTE_KEY
+    elif mixed and fit_one_chat(files, part_size):
+        text += ("%d files ready - they fit in one Claude chat. Click Show in folder and drag in "
+                 "%s" % (len(files), docs_first(files)))
+    elif mixed:
+        text += ("%d files ready - use a new Claude chat for each file, starting with %s. Click "
+                 "Show in folder, then drag one in"
+                 % (len(files), the_files(kind_counts(files)[0], "emails")))
     elif fit_one_chat(files, part_size):
         text += ("%d files ready - they fit in one Claude chat. Click Show in folder and drag "
                  "them in" % len(files))
@@ -332,8 +473,24 @@ def results_tip(files, can_copy, part_size=None):
     how = ("click Show in folder and drag a file into Claude, or click Copy file then press %s"
            % PASTE_KEY if can_copy else
            "click Show in folder and drag a file into Claude, or use Copy text and paste it")
-    start = ("%d files, oldest conversations first (the Dates column shows what each covers). "
-             % len(files))
+    emails, documents = kind_counts(files)
+    if emails and documents:
+        if fit_one_chat(files, part_size):
+            return ("Drag in %s. Together they are small enough for one Claude chat. To use a "
+                    "file, %s." % (docs_first(files), how))
+        if part_size == "small":
+            start = "Start a new Claude chat for each file, or drag in only the ones you need"
+        else:
+            start = ("Start a new Claude chat for each file - together they are too big for one "
+                     "chat")
+        return ("%s. Begin with %s; use %s when you need what the attachments say. To use one, "
+                "%s." % (start, the_files(emails, "emails"), the_files(documents, "documents"),
+                         how))
+    if documents:
+        start = "%d documents files (the Dates column shows what each covers). " % len(files)
+    else:
+        start = ("%d files, oldest conversations first (the Dates column shows what each "
+                 "covers). " % len(files))
     if fit_one_chat(files, part_size):
         return start + ("Together they are small enough for one Claude chat: %s, one after the "
                         "other." % (how[0].lower() + how[1:]))
@@ -391,16 +548,18 @@ last_run_from_result = projects.last_run_from_result
 
 
 def summary_text(result):
-    """One or two plain-English sentences describing a run."""
+    """A few plain-English sentences describing a run."""
     stats = result.get("stats") or {}
-    files = result.get("files") or []
+    all_files = result.get("files") or []
+    files = [f for f in all_files if file_kind(f) == "emails"]
+    doc_files = [f for f in all_files if file_kind(f) == "documents"]
     tokens = sum(int(f.get("est_tokens") or 0) for f in files)
     found = result.get("files_found") or stats.get("emails_in") or 0
     if files:
         text = "%s → %s used in %s, %s, ~%s tokens." % (
             plural(found, "email"), fmt_int(stats.get("emails_used", 0)),
-            plural(stats.get("threads", 0), "thread"), plural(len(files), "file"),
-            fmt_tokens(tokens))
+            plural(stats.get("threads", 0), "thread"),
+            plural(len(files), "emails file" if doc_files else "file"), fmt_tokens(tokens))
     else:
         text = ("%s read, but none were left to write - check the dates and focus keywords."
                 % plural(found, "email"))
@@ -429,7 +588,49 @@ def summary_text(result):
         text += " %s in a folder Squish can't open %s left out (see run log)." % (
             plural(stats["no_access_emails"], "email"),
             "is" if stats["no_access_emails"] == 1 else "are")
+    documents = documents_summary(stats, doc_files)
+    if documents:
+        text += " " + documents
+    docs_failed, docs_folders = doc_problem_counts(result)
+    if docs_failed:
+        text += " %s couldn't be read (see run log)." % plural(docs_failed, "document")
+    if docs_folders:
+        text += " The documents folder (or a folder in it) couldn't be opened (see run log)."
     return text
+
+
+def documents_summary(stats, doc_files):
+    """'73 documents condensed (incl. 9 drawings) into 1 documents file, ~43k tokens,
+    plus 31 other files listed.' for a run that wrote a documents file
+    (``doc_files``), else ''. Drawings count as documents here, as in the
+    Contains column."""
+    if not doc_files:
+        return ""
+    drawings = int(stats.get("doc_drawings") or 0)
+    count = int(stats.get("documents") or 0) + drawings
+    if not count:
+        return ""
+    text = "%s condensed" % plural(count, "document")
+    if drawings:
+        text += " (incl. %s)" % plural(drawings, "drawing")
+    text += " into %s, ~%s tokens" % (plural(len(doc_files), "documents file"),
+                                      fmt_tokens(sum(int(f.get("est_tokens") or 0) for f in doc_files)))
+    if stats.get("doc_other"):
+        text += ", plus %s listed" % plural(stats["doc_other"], "other file")
+    return text + "."
+
+
+def doc_problem_counts(result):
+    """(documents that couldn't be read, documents folders that couldn't be opened)
+    for a RunResult or a saved last_run (which keeps only the counts)."""
+    problems = result.get("doc_problems")
+    if problems is None:
+        total = int(result.get("doc_problem_count") or 0)
+        folders = min(total, int(result.get("doc_problem_folders") or 0))
+        return total - folders, folders
+    from . import engine
+    folders = sum(1 for item in problems if engine.is_doc_folder_problem(item[1]))
+    return len(problems) - folders, folders
 
 
 def failure_counts(result):
@@ -547,6 +748,25 @@ def reader_status():
         return "Outlook .msg: reader unavailable"
 
 
+def pdf_reader_status():
+    """docs.backend_status() (e.g. 'PDF: pypdf 5.1.0'), or '' if the documents
+    code can't be loaded. Slow-ish (loads pypdf): call it from a thread."""
+    try:
+        from . import docs
+        return docs.backend_status()
+    except Exception:
+        return ""
+
+
+def pdf_reader_text(status):
+    """(text, hint style) for the Documents tab's PDF reader line."""
+    if not status:
+        return "unavailable (Squish's document reader couldn't be loaded)", "Warn"
+    if status.startswith("PDF: pypdf"):
+        return status[len("PDF: "):].strip(), "Hint"
+    return PDF_ADVICE, "Hint"
+
+
 def windows_setup():
     """Sharp text on high-DPI screens and the Squish icon on the taskbar (Windows only)."""
     if not IS_WINDOWS:
@@ -624,7 +844,7 @@ class TextWindow(tk.Toplevel):
 class SettingsForm(ttk.Notebook):
     """Tabs with one project's settings. Calls app.on_setting_changed(field) on each edit."""
 
-    TAB_EMAILS, TAB_SQUEEZE, TAB_ADVANCED = 0, 1, 2
+    TAB_EMAILS, TAB_DOCUMENTS, TAB_SQUEEZE, TAB_ADVANCED = 0, 1, 2, 3
 
     def __init__(self, parent, app):
         ttk.Notebook.__init__(self, parent)
@@ -648,8 +868,12 @@ class SettingsForm(ttk.Notebook):
         self.keywords_var = tk.StringVar()
         self.noise_var = tk.BooleanVar(value=True)
         self.recover_var = tk.BooleanVar(value=True)
+        self.attachments_var = tk.BooleanVar(value=True)
+        self.docs_var = tk.StringVar()
+        self.docs_subfolders_var = tk.BooleanVar(value=True)
 
         self._build_emails_tab()
+        self._build_documents_tab()
         self._build_squeeze_tab()
         self._build_advanced_tab()
 
@@ -658,7 +882,9 @@ class SettingsForm(ttk.Notebook):
                  ("date_from", self.from_var), ("date_to", self.to_var),
                  ("squeeze", self.squeeze_var), ("part_size", self.size_var),
                  ("focus_keywords", self.keywords_var), ("drop_noise", self.noise_var),
-                 ("recover_quoted", self.recover_var)]
+                 ("recover_quoted", self.recover_var),
+                 ("docs_from_attachments", self.attachments_var), ("docs_folder", self.docs_var),
+                 ("docs_include_subfolders", self.docs_subfolders_var)]
         for field, var in watch:
             var.trace_add("write", lambda *_args, f=field: self._changed(f))
         self.org_text.bind("<<Modified>>", self._org_modified)
@@ -757,6 +983,33 @@ class SettingsForm(ttk.Notebook):
         ttk.Label(dates, text="YYYY-MM-DD", style="Hint.TLabel").pack(side="left")
         self.dates_hint = self._hint(tab, 8)
 
+    def _build_documents_tab(self):
+        tab = self._tab("Documents")
+        px = self.px
+        self._label(tab, 0, "Attachments")
+        ttk.Checkbutton(tab, text="Condense Word, Excel, PowerPoint and PDF attachments",
+                        variable=self.attachments_var).grid(
+            row=0, column=1, columnspan=2, sticky="w", pady=(px(5), 0))
+        self.attachments_hint = self._hint(tab, 1)
+
+        self._label(tab, 2, "Documents folder")
+        self.docs_entry = ttk.Entry(tab, textvariable=self.docs_var)
+        self.docs_entry.grid(row=2, column=1, sticky="ew", pady=(px(3), 0))
+        ttk.Button(tab, text="Browse...", command=self.browse_docs).grid(
+            row=2, column=2, sticky="w", padx=(px(6), 0), pady=(px(3), 0))
+        self.docs_hint = self._hint(tab, 3, keep=True)    # the live 'N documents found'
+        self.docs_entry.bind("<FocusOut>", lambda e: self._tidy_folder(self.docs_var,
+                                                                       self.docs_entry))
+        self.docs_entry.bind("<Return>", lambda e: self._tidy_folder(self.docs_var,
+                                                                     self.docs_entry))
+        self.docs_entry.bind("<Configure>", self._folder_box_resized, add="+")
+        ttk.Checkbutton(tab, text="Include subfolders", variable=self.docs_subfolders_var).grid(
+            row=4, column=1, columnspan=2, sticky="w", pady=(0, px(3 if self.compact else 8)))
+
+        self._label(tab, 5, "PDF reader")
+        self.pdf_hint = self._hint(tab, 5, PDF_CHECKING, keep=True)
+        self.pdf_hint.grid_configure(pady=(px(5), 0))
+
     def _build_squeeze_tab(self):
         tab = self._tab("Squeeze")
         px = self.px
@@ -834,6 +1087,9 @@ class SettingsForm(ttk.Notebook):
             self.keywords_var.set(project.get("focus_keywords", ""))
             self.noise_var.set(bool(project.get("drop_noise", True)))
             self.recover_var.set(bool(project.get("recover_quoted", True)))
+            self.attachments_var.set(bool(project.get("docs_from_attachments", True)))
+            self.docs_var.set(project.get("docs_folder", ""))
+            self.docs_subfolders_var.set(bool(project.get("docs_include_subfolders", True)))
             self.org_text.delete("1.0", "end")
             self.org_text.insert("1.0", project.get("org_codes", ""))
             self.org_text.edit_reset()
@@ -846,7 +1102,7 @@ class SettingsForm(ttk.Notebook):
     def show_folder_ends(self):
         """Scroll the folder boxes to the end of their paths: the last folder names
         ('...\\04 Correspondence\\01 Emails') say which folder was picked."""
-        for entry in (self.source_entry, self.output_entry):
+        for entry in (self.source_entry, self.output_entry, self.docs_entry):
             entry.icursor("end")
             entry.xview_moveto(1.0)
 
@@ -876,6 +1132,9 @@ class SettingsForm(ttk.Notebook):
             "org_codes": self.org_text.get("1.0", "end").strip(),
             "drop_noise": bool(self.noise_var.get()),
             "recover_quoted": bool(self.recover_var.get()),
+            "docs_from_attachments": bool(self.attachments_var.get()),
+            "docs_folder": paths.clean_folder_text(self.docs_var.get()),
+            "docs_include_subfolders": bool(self.docs_subfolders_var.get()),
         }
 
     @staticmethod
@@ -989,6 +1248,16 @@ class SettingsForm(ttk.Notebook):
             text = [d for k, _, d in self.size_choices if k == key]
             self.set_hint(self.size_hint, (text[0] if text else "") +
                           " Too big for Claude? Choose Small and use one chat per file.")
+        if field in (None, "docs_from_attachments", "docs_folder"):
+            if v["docs_from_attachments"]:
+                self.set_hint(self.attachments_hint, "Their text goes into a separate documents "
+                              "file next to the emails file, so the emails file stays small.")
+            elif v["docs_folder"]:
+                self.set_hint(self.attachments_hint, "Attachments are only listed by name in the "
+                              "emails file.")
+            else:
+                self.set_hint(self.attachments_hint, "Attachments are only listed by name in the "
+                              "emails file, and no documents file is made.")
         if field in (None, "org_codes"):
             problem = org_codes_problem(v["org_codes"])
             if problem:
@@ -1041,6 +1310,22 @@ class SettingsForm(ttk.Notebook):
         self.source_var.set(folder)
         self.show_folder_ends()
 
+    def browse_docs(self):
+        # Start next to the emails folder: a job's Reports folder is usually there.
+        start = (paths.clean_folder_text(self.docs_var.get()) or
+                 os.path.dirname(paths.clean_folder_text(self.source_var.get()).rstrip("\\/")))
+        folder = filedialog.askdirectory(
+            parent=self, title="Choose a folder of documents to condense (e.g. Reports)",
+            initialdir=start or None, mustexist=True)
+        if folder:
+            self.docs_var.set(os.path.normpath(folder))
+            self.show_folder_ends()
+
+    def set_pdf_status(self, status):
+        """Show docs.backend_status() (see pdf_reader_text) on the Documents tab."""
+        text, kind = pdf_reader_text(status)
+        self.set_hint(self.pdf_hint, text, kind)
+
     def browse_output(self):
         current = paths.clean_folder_text(self.output_var.get())
         if not current:
@@ -1059,9 +1344,10 @@ class SettingsForm(ttk.Notebook):
 class ResultsPanel(ttk.LabelFrame):
     """The files made by the last run, with buttons to hand them to Claude."""
 
-    COLUMNS = (("file", "File", 220, True), ("size", "Size (KB)", 72, False),
-               ("tokens", "~Tokens", 70, False), ("dates", "Dates", 195, False),
-               ("emails", "Emails", 60, False))
+    COLUMNS = (("file", "File", 220, True), ("type", "Type", 82, False),
+               ("size", "Size (KB)", 72, False), ("tokens", "~Tokens", 70, False),
+               ("dates", "Dates", 195, False), ("contains", "Contains", 100, False))
+    LEFT = ("file", "type", "dates")     # text columns; the numbers are right-aligned
 
     def __init__(self, parent, app):
         compact = getattr(app, "compact", False)       # short screen: tighter spacing
@@ -1080,13 +1366,14 @@ class ResultsPanel(ttk.LabelFrame):
         self.tree = ttk.Treeview(self, columns=[c[0] for c in self.COLUMNS], show="headings",
                                  height=4, selectmode="browse")
         for key, title, width, stretch in self.COLUMNS:
-            self.tree.heading(key, text=title, anchor="w" if key in ("file", "dates") else "e")
+            self.tree.heading(key, text=title, anchor="w" if key in self.LEFT else "e")
             self.tree.column(key, width=px(width), minwidth=px(50), stretch=stretch,
-                             anchor="w" if key in ("file", "dates") else "e")
+                             anchor="w" if key in self.LEFT else "e")
         scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.grid(row=1, column=0, sticky="nsew")
         scroll.grid(row=1, column=1, sticky="ns")
+        self.tree.bind("<Configure>", self._fit_columns, add="+")
         self.tree.bind("<Double-1>", lambda e: self.show_in_folder())
         self.tree.bind("<Return>", lambda e: self.show_in_folder())
 
@@ -1117,6 +1404,16 @@ class ResultsPanel(ttk.LabelFrame):
         width = max(event.width - self.app.px(30), self.app.px(200))
         self.summary.configure(wraplength=width)
         self.tip.configure(wraplength=width)
+
+    def _fit_columns(self, event):
+        """Give the File column the room the other columns leave. (Tk only shrinks
+        it when the window is resized, not when the window opens small, so on a
+        small screen the last columns would be cut off.)"""
+        fixed = sum(int(self.tree.column(key, "width")) for key, _title, _width, stretch
+                    in self.COLUMNS if not stretch)
+        width = max(self.app.px(80), event.width - fixed - self.app.px(4))
+        if abs(int(self.tree.column("file", "width")) - width) > 2:
+            self.tree.column("file", width=width)
 
     # ---- filling -------------------------------------------------------------
 
@@ -1151,9 +1448,13 @@ class ResultsPanel(ttk.LabelFrame):
                 dates = "%s → %s" % (first, last)
             else:
                 dates = first or last or "undated"
+            if file_kind(f) == "documents":
+                kind, contains = "Documents", plural(f.get("documents") or 0, "document")
+            else:
+                kind, contains = "Emails", plural(f.get("emails") or 0, "email")
             self.tree.insert("", "end", iid=str(i), values=(
-                short_file_name(f["path"]), fmt_int(round((f.get("bytes") or 0) / 1024.0)),
-                fmt_tokens(f.get("est_tokens")), dates, fmt_int(f.get("emails"))))
+                short_file_name(f["path"]), kind, fmt_int(round((f.get("bytes") or 0) / 1024.0)),
+                fmt_tokens(f.get("est_tokens")), dates, contains))
         if self.files:
             self.tree.selection_set("0")
             self.tree.focus("0")
@@ -1282,6 +1583,10 @@ class SquishApp(object):
         self.count_job = None
         self.count_token = 0
         self.count_stop = threading.Event()
+        self.docs_count_job = None   # the same three for the documents folder
+        self.docs_count_token = 0
+        self.docs_count_stop = threading.Event()
+        self.pdf_status = None       # docs.backend_status() once known ('' = unavailable)
         self.files_token = 0     # bumped whenever the results table shows something new
         self.run = None          # dict while a run is going: id, project_id, cancel, name
         self.last_click = {}     # button key -> time.monotonic() of its last accepted click
@@ -1310,6 +1615,7 @@ class SquishApp(object):
         else:
             self.show_empty_state()
         self.start_thread(lambda: self.post(("backend", reader_status())))
+        self.start_thread(lambda: self.post(("pdf_backend", pdf_reader_status())))
         self.poll_job = root.after(POLL_MS, self.poll_queue)
         if self.load_problem:
             root.after(50, self.report_load_problem)
@@ -1747,6 +2053,7 @@ class SquishApp(object):
             if stop and stop[1]:     # the stopped run's log, e.g. the files it couldn't read
                 self.results.set_log_path(stop[1])
         self.schedule_count(delay=0)
+        self.schedule_docs_count(delay=0)
         if not self.run:
             if stop and stop[0]:
                 self.set_status(stop[0], "Error")
@@ -1849,6 +2156,8 @@ class SquishApp(object):
             self._rename_in_list(project)
         if field in ("source_folder", "include_subfolders"):
             self.schedule_count()
+        if field in ("docs_folder", "docs_include_subfolders", "output_folder"):
+            self.schedule_docs_count()
         self.schedule_save()
 
     def schedule_save(self):
@@ -2002,6 +2311,71 @@ class SquishApp(object):
         else:
             self.form.set_hint(hint, "Can't open this folder: %s" % value, "Error")
 
+    # ---- counting the files in the documents folder ------------------------------------
+
+    def schedule_docs_count(self, delay=COUNT_DELAY_MS):
+        if self.docs_count_job is not None:
+            self.root.after_cancel(self.docs_count_job)
+        self.docs_count_job = self.root.after(delay, self.start_docs_count)
+
+    def start_docs_count(self):
+        """Count the documents in the documents folder in a background thread."""
+        self.docs_count_job = None
+        self.docs_count_stop.set()           # stop the previous count, if any
+        self.docs_count_token += 1
+        token = self.docs_count_token
+        values = self.form.values()
+        folder = values["docs_folder"]
+        hint = self.form.docs_hint
+        if not folder:
+            self.form.set_hint(hint, "Optional - for example the project's Reports folder. "
+                               "Leave blank to condense only the attachments.")
+            return
+        out_dir = values["output_folder"] or str(paths.default_output_folder(
+            values["name"] or projects.DEFAULT_NAME))
+        problem = docs_folder_problem(folder, out_dir)
+        if problem:
+            self.form.set_hint(hint, problem, "Warn")
+            return
+        stop = threading.Event()
+        self.docs_count_stop = stop
+        subfolders = values["docs_include_subfolders"]
+        self.form.set_hint(hint, "Counting documents...")
+
+        def work():
+            skipped = []
+            try:
+                counts = count_document_files(
+                    folder, subfolders, stop,
+                    lambda n: self.post(("docs_count", token, "progress", n)), skipped, out_dir)
+                if counts is not None:
+                    self.post(("docs_count", token, "done", counts, len(skipped)))
+            except FileNotFoundError:
+                self.post(("docs_count", token, "missing", 0))
+            except OSError as exc:
+                self.post(("docs_count", token, "error", exc.strerror or str(exc)))
+            except Exception as exc:     # never let a count break the window
+                self.post(("docs_count", token, "error", "%s: %s" % (type(exc).__name__, exc)))
+
+        self.start_thread(work)
+
+    def _show_docs_count(self, token, kind, value, skipped=0):
+        if token != self.docs_count_token:
+            return  # the folder has changed since this count started
+        hint = self.form.docs_hint
+        subfolders = self.form.docs_subfolders_var.get()
+        if kind == "progress":
+            self.form.set_hint(hint, "Counting documents... %s files so far" % fmt_int(value))
+        elif kind == "done":
+            self.form.set_hint(hint, *docs_count_text(value[0], value[1], skipped, subfolders))
+        elif kind == "missing":
+            self.form.set_hint(hint, "Can't find this folder, so Squish will skip it. If it's on "
+                               "a network drive (like H:), check you're connected to the office "
+                               "network or VPN.", "Warn")
+        else:
+            self.form.set_hint(hint, "Can't open this folder, so Squish will skip it: %s" % value,
+                               "Warn")
+
     # ---- running ----------------------------------------------------------------------
 
     def on_run_button(self):
@@ -2079,6 +2453,8 @@ class SquishApp(object):
         stage = self.run.get("stage")
         if stage == "read":
             self.set_status("Cancelling - finishing the emails being read now...")
+        elif stage == "documents":
+            self.set_status("Cancelling - finishing the documents being read now...")
         elif stage == "digest":
             self.set_status("Cancelling - stopping the digest step...")
         else:
@@ -2099,7 +2475,10 @@ class SquishApp(object):
             return
         # While another project is shown, say which project the progress is for.
         prefix = self._run_prefix(self.run)
-        counted = total > 1 if stage == "digest" else stage in ("read", "write") and total > 0
+        if stage in ("digest", "documents"):
+            counted = total > 1
+        else:
+            counted = stage in ("read", "write") and total > 0
         if counted:
             if str(self.progress.cget("mode")) != "determinate":
                 self.progress.stop()
@@ -2107,6 +2486,8 @@ class SquishApp(object):
             self.progress.configure(maximum=total, value=done)
             if stage == "read":
                 message = "Reading %s of %s emails..." % (fmt_int(done), fmt_int(total))
+            elif stage == "documents":
+                message = "Condensing documents %s of %s..." % (fmt_int(done), fmt_int(total))
             self.set_status(prefix + (message or ("Saving..." if stage == "write" else "Working...")))
         else:
             if str(self.progress.cget("mode")) != "indeterminate":
@@ -2151,7 +2532,8 @@ class SquishApp(object):
         other = "" if project is None or on_screen else short_name(run["name"])
         # Amber, not green, when emails may be missing (files that couldn't be
         # read, folders that couldn't be opened): the summary says which.
-        missing = any(failure_counts(result)) or (result.get("stats") or {}).get("no_access_emails")
+        missing = (any(failure_counts(result)) or (result.get("stats") or {}).get("no_access_emails")
+                   or doc_problem_counts(result)[1])   # (or the documents folder couldn't be read)
         self.set_status(done_message(result.get("elapsed_s", 0), files, can_copy_files(), other,
                                      run.get("filters", ""), run.get("part_size")),
                         "Warn" if missing else "Good")
@@ -2268,10 +2650,15 @@ class SquishApp(object):
             self._run_crash(message[1], message[2])
         elif kind == "count":
             self._show_count(*message[1:])
+        elif kind == "docs_count":
+            self._show_docs_count(*message[1:])
         elif kind == "files_checked":
             self._files_checked(*message[1:])
         elif kind == "backend":
             self.backend_label.configure(text=message[1])
+        elif kind == "pdf_backend":
+            self.pdf_status = message[1]
+            self.form.set_pdf_status(message[1])
         elif kind == "clip":
             self.set_status(message[2], "Good" if message[1] else "Error")
         elif kind == "shortcut":
@@ -2342,11 +2729,13 @@ class SquishApp(object):
 
     def show_about(self):
         messagebox.showinfo("About Squish", (
-            "Squish %s\n%s.\n\n%s\nPython %s, Tk %s\n\nSettings are kept in:\n%s\n"
+            "Squish %s\n%s.\n\n%s\n%s\nPython %s, Tk %s\n\nSettings are kept in:\n%s\n"
             "Run logs and the read cache:\n%s\n\n"
             "Everything runs on this computer. Nothing is uploaded - only the files you "
             "choose to drag into Claude leave it."
-            % (__version__, TAGLINE, self.backend_label.cget("text"), sys.version.split()[0],
+            % (__version__, TAGLINE, self.backend_label.cget("text"),
+               "PDF: checking reader..." if self.pdf_status is None else
+               self.pdf_status or "PDF: reader unavailable", sys.version.split()[0],
                tk.TkVersion, paths.data_dir(), paths.local_data_dir())), parent=self.root)
 
     # ---- errors and closing ---------------------------------------------------------------
@@ -2387,6 +2776,7 @@ class SquishApp(object):
             run["cancel"].set()     # harmless if it has finished meanwhile
         self.flush_save()
         self.count_stop.set()
+        self.docs_count_stop.set()
         self.closing = True
         if self._run_thread_alive():
             # Let the run save the emails it has read (the read cache) and finish

@@ -275,6 +275,188 @@ class HelperTests(TempDataDir):
             self.assertFalse(gui.path_too_long_for_explorer(long_path))
 
 
+@unittest.skipIf(gui is None, "tkinter is not available")
+class DocumentHelperTests(TempDataDir):
+    """The Documents tab's helpers and the wording for runs with a documents file."""
+
+    EMAILS = {"path": os.path.join("out", "Squish - Job - 2024-08-22 to 2025-11-30.txt"),
+              "est_tokens": 60000, "emails": 1876, "kind": "emails"}
+    DOCS = {"path": os.path.join("out", "Squish - Job - documents - 2024-08-22 to 2025-11-30.txt"),
+            "est_tokens": 40000, "documents": 64, "kind": "documents"}
+
+    def make_files(self, folder, names):
+        for name in names:
+            path = os.path.join(folder, *name.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write("x")
+
+    def test_count_documents_and_other_files(self):
+        folder = tempfile.mkdtemp(dir=self.data_dir)
+        self.make_files(folder, [
+            "Geotech report.pdf", "Cost plan.xlsx", "Minutes.docx", "Slides.pptx", "Notes.txt",
+            "Survey.csv", "Spec.rtf", "Photos.zip",                     # 8 documents
+            "Old report.doc", "Site plan.dwg", "IMG_0012.jpg",           # 3 other files
+            "Email.msg", "Reply.eml", "~$Minutes.docx", ".hidden.pdf",   # never counted
+            "Squish - Job - 2025-01-01 to 2025-01-02.txt",              # a digest file
+            "Sub/Drainage report.pdf", "Sub/Sketch.png",
+            "Digests/Squish - Job - documents - undated.txt", "Digests/Kept.pdf"])
+        stop = threading.Event()
+        self.assertEqual(gui.count_document_files(folder, True, stop, lambda n: None), (10, 4))
+        self.assertEqual(gui.count_document_files(folder, False, stop, lambda n: None), (8, 3))
+        # The output folder (and everything in it) is left out, as in a run.
+        out = os.path.join(folder, "Digests")
+        self.assertEqual(gui.count_document_files(folder, True, stop, lambda n: None,
+                                                  skip_folder=out), (9, 4))
+        stop.set()
+        self.assertIsNone(gui.count_document_files(folder, True, stop, lambda n: None))
+
+    def test_count_documents_reports_folders_it_cannot_open(self):
+        folder = tempfile.mkdtemp(dir=self.data_dir)
+        self.make_files(folder, ["a.pdf", "Locked/b.pdf"])
+        with self.assertRaises(FileNotFoundError):
+            gui.count_document_files(os.path.join(folder, "gone"), True, threading.Event(),
+                                     lambda n: None)
+        real_scandir = os.scandir
+
+        def scandir(path="."):
+            if os.path.basename(str(path)) == "Locked":
+                raise PermissionError(13, "Access is denied", path)
+            return real_scandir(path)
+
+        skipped = []
+        with mock.patch("os.scandir", side_effect=scandir):
+            counts = gui.count_document_files(folder, True, threading.Event(), lambda n: None,
+                                              skipped)
+        self.assertEqual(counts, (1, 0))
+        self.assertEqual([os.path.basename(p) for p in skipped], ["Locked"])
+
+        def scandir_top(path="."):
+            if os.path.abspath(str(path)) == os.path.abspath(paths.long_path(folder)):
+                raise PermissionError(13, "Access is denied", path)
+            return real_scandir(path)
+
+        with mock.patch("os.scandir", side_effect=scandir_top):
+            with self.assertRaises(OSError) as caught:
+                gui.count_document_files(folder, True, threading.Event(), lambda n: None)
+        self.assertIn("Access is denied", str(caught.exception))
+        self.assertNotIn("folder could not be opened", str(caught.exception))
+
+    def test_document_names_without_the_documents_code(self):
+        self.assertTrue(gui.is_document_name("Report.PDF"))
+        self.assertFalse(gui.is_document_name("Old report.doc"))
+        # If the documents code can't be used, the same list of types still counts.
+        with mock.patch("squish_app.docs.is_supported", side_effect=RuntimeError("broken")):
+            self.assertTrue(gui.is_document_name("Cost plan.xlsx"))
+            self.assertTrue(gui.is_document_name("Photos.ZIP"))
+            self.assertFalse(gui.is_document_name("Site plan.dwg"))
+
+    def test_docs_count_text(self):
+        text, style = gui.docs_count_text(64, 31, 0, True)
+        self.assertEqual(text, "64 documents found (incl. subfolders) - plus 31 other files, "
+                               "listed by name only.")
+        self.assertEqual(style, "Good")
+        text, style = gui.docs_count_text(1, 0, 2, False)
+        self.assertEqual(text, "1 document found (this folder only) (2 subfolders couldn't be "
+                               "opened).")
+        self.assertEqual(style, "Warn")
+        text, style = gui.docs_count_text(0, 3, 0, False)
+        self.assertIn("No Word, Excel, PowerPoint, PDF or text files here - just 3 other files",
+                      text)
+        self.assertIn("Tick 'Include subfolders'", text)
+        self.assertEqual(style, "Warn")
+        self.assertEqual(gui.docs_count_text(0, 0, 0, True), ("No files here.", "Warn"))
+        text, style = gui.docs_count_text(gui.MANY_DOCUMENTS + 1, 0, 0, True)
+        self.assertIn("takes a while", text)
+        self.assertEqual(style, "Warn")
+
+    def test_docs_folder_that_is_the_output_folder(self):
+        out = os.path.join(self.data_dir, "Out")
+        self.assertTrue(gui.docs_folder_problem(out, out))
+        self.assertTrue(gui.docs_folder_problem(os.path.join(out, "Sub"), out))
+        self.assertEqual(gui.docs_folder_problem(os.path.join(self.data_dir, "Reports"), out), "")
+        self.assertEqual(gui.docs_folder_problem("", out), "")
+
+    def test_pdf_reader_text(self):
+        self.assertEqual(gui.pdf_reader_text("PDF: pypdf 5.1.0"), ("pypdf 5.1.0", "Hint"))
+        text, style = gui.pdf_reader_text("PDF: built-in reader (install pypdf for best results)")
+        self.assertEqual((text, style), (gui.PDF_ADVICE, "Hint"))
+        self.assertTrue(text.startswith("PDFs are read with Squish's built-in reader. For better "
+                                        "results,"))
+        self.assertEqual(gui.pdf_reader_text("")[1], "Warn")       # documents code missing
+        with mock.patch.dict(os.environ, {"SQUISH_NO_PYPDF": "1"}):
+            self.assertEqual(gui.pdf_reader_text(gui.pdf_reader_status())[0], gui.PDF_ADVICE)
+        with mock.patch("squish_app.docs.backend_status", side_effect=RuntimeError("broken")):
+            self.assertEqual(gui.pdf_reader_status(), "")
+
+    def test_file_kinds_and_short_names(self):
+        self.assertEqual(gui.file_kind(self.DOCS), "documents")
+        self.assertEqual(gui.file_kind(self.EMAILS), "emails")
+        self.assertEqual(gui.file_kind({"path": "x.txt"}), "emails")   # saved before v1.1
+        self.assertEqual(gui.short_file_name(self.DOCS["path"]),
+                         "documents - 2024-08-22 to 2025-11-30.txt")
+        self.assertEqual(gui.short_file_name(os.path.join(
+            "x", "Squish - Job - documents - undated (focus pump) (part 2 of 2).txt")),
+            "documents - undated (focus pump) (part 2 of 2).txt")
+        self.assertEqual(gui.short_file_name(self.EMAILS["path"]), "2024-08-22 to 2025-11-30.txt")
+
+    def test_emails_file_first_then_the_documents_file(self):
+        files = [self.EMAILS, self.DOCS]                    # 100k tokens: one chat
+        tip = gui.results_tip(files, True)
+        self.assertTrue(tip.startswith("Drag in the emails file first; add the documents file "
+                                       "when you need what the attachments say."))
+        self.assertIn("small enough for one Claude chat", tip)
+        done = gui.done_message(5, files, True)
+        self.assertIn("2 files ready - they fit in one Claude chat", done)
+        self.assertIn("the emails file first; add the documents file when you need what the "
+                      "attachments say", done)
+        big = [dict(self.EMAILS, est_tokens=130000), self.DOCS]
+        tip = gui.results_tip(big, False)
+        self.assertIn("new Claude chat for each file", tip)
+        self.assertIn("Begin with the emails file; use the documents file", tip)
+        self.assertNotIn("Copy file", tip)
+        self.assertIn("use a new Claude chat for each file, starting with the emails file",
+                      gui.done_message(5, big, True))
+        # Several parts of each: plurals, and a Small run is never one chat.
+        parts = [self.EMAILS, self.EMAILS, self.DOCS, self.DOCS]
+        for part_size in ("small", "medium"):
+            tip = gui.results_tip([dict(f, est_tokens=10000) for f in parts], True, part_size)
+            self.assertEqual("one Claude chat" in tip, part_size == "medium", tip)
+        self.assertIn("the emails files first; add the documents files",
+                      gui.results_tip([dict(f, est_tokens=10000) for f in parts], True))
+        self.assertIn("only the ones you need", gui.results_tip(parts, True, "small"))
+        # A run whose filters left no emails can write only a documents file.
+        self.assertEqual(gui.results_tip([self.DOCS], True), gui.TIP)
+        self.assertTrue(gui.results_tip([self.DOCS, self.DOCS], True).startswith(
+            "2 documents files"))
+
+    def test_summary_mentions_the_documents(self):
+        result = {"files": [self.EMAILS, self.DOCS], "files_found": 2345,
+                  "stats": {"emails_used": 1876, "threads": 214, "documents": 64,
+                            "doc_drawings": 9, "doc_other": 31, "doc_versions": 5,
+                            "doc_failed": 3},
+                  "failed": [],
+                  "doc_problems": [["Old scan.pdf (attached to x.msg)", "no text"]] * 3 + [
+                      ["H:\\Job\\Reports", "documents folder not found: check the VPN"]]}
+        text = gui.summary_text(result)
+        self.assertIn("2,345 emails → 1,876 used in 214 threads, 1 emails file, ~60k tokens.", text)
+        self.assertIn("73 documents condensed (incl. 9 drawings) into 1 documents file, ~40k tokens, "
+                      "plus 31 other files listed.", text)
+        self.assertIn("3 documents couldn't be read (see run log).", text)
+        self.assertIn("The documents folder (or a folder in it) couldn't be opened", text)
+        # A saved last_run keeps only the counts, and reads the same.
+        self.assertEqual(gui.summary_text(projects.last_run_from_result(result)), text)
+        # Drawings count as documents (as in the Contains column); a run without a
+        # documents file says nothing about documents.
+        self.assertIn("2 documents condensed (incl. 2 drawings) into 1 documents file, ~40k tokens.",
+                      gui.summary_text({"files": [self.EMAILS, self.DOCS], "stats": {"doc_drawings": 2}}))
+        self.assertIn("1 document condensed into 1 documents file, ~40k tokens.", gui.summary_text(
+            {"files": [self.EMAILS, self.DOCS], "stats": {"documents": 1}}))
+        plain = gui.summary_text({"files": [self.EMAILS], "files_found": 5,
+                                  "stats": {"emails_used": 5, "threads": 2}})
+        self.assertNotIn("document", plain)
+
+
 @unittest.skipIf(not has_display(), "no display (or no tkinter)")
 class WindowTests(TempDataDir):
     """SquishApp itself, without mainloop: methods are called directly."""
@@ -305,6 +487,10 @@ class WindowTests(TempDataDir):
     @staticmethod
     def _destroy(root):
         try:
+            # Cancel the window's timers first: Tk runs every window's timers when any
+            # window updates, so a later test's update() would call into this one.
+            for job in root.tk.splitlist(root.tk.call("after", "info")):
+                root.tk.call("after", "cancel", job)
             root.destroy()
         except tk.TclError:
             pass
@@ -843,6 +1029,177 @@ class WindowTests(TempDataDir):
         run = self.fake_run(app, a, run_id=2)
         app._run_error(2, "Squish stopped because x.\n\nNothing was changed.")
         self.assertEqual(app.results.log_path, "")
+
+    # ---- documents ----------------------------------------------------------------
+
+    def test_documents_settings_are_shown_and_saved(self):
+        a = projects.new_project("Alpha")
+        a["docs_from_attachments"] = False
+        a["docs_folder"] = os.path.join(self.data_dir, "Reports")
+        a["docs_include_subfolders"] = False
+        b = projects.new_project("Bravo")        # defaults
+        app = self.open_app([a, b])
+        form = app.form
+        self.assertEqual(form.tab(gui.SettingsForm.TAB_DOCUMENTS, "text").strip(), "Documents")
+        self.assertFalse(form.attachments_var.get())
+        self.assertEqual(form.docs_var.get(), a["docs_folder"])
+        self.assertFalse(form.docs_subfolders_var.get())
+        self.assertIn("only listed by name", form.attachments_hint.cget("text"))
+        app.select_project(b["id"])
+        app.start_docs_count()       # (select_project schedules it for when the window is idle)
+        self.assertTrue(form.attachments_var.get())
+        self.assertEqual(form.docs_var.get(), "")
+        self.assertTrue(form.docs_subfolders_var.get())
+        self.assertIn("separate documents file", form.attachments_hint.cget("text"))
+        self.assertIn("Optional", form.docs_hint.cget("text"))
+        # Edits are saved like every other setting (quotes from 'Copy as path' removed).
+        reports = os.path.join(self.data_dir, "Job", "04 Reports")
+        form.docs_var.set('"%s"' % reports)
+        form.docs_subfolders_var.set(False)
+        form.attachments_var.set(False)
+        self.assertIsNotNone(app.save_job)
+        self.assertTrue(app.flush_save())
+        saved = projects.find_project(projects.load_projects(), b["id"])
+        self.assertEqual((saved["docs_folder"], saved["docs_include_subfolders"],
+                          saved["docs_from_attachments"]), (reports, False, False))
+        self.assertEqual(form.attachments_hint.cget("text"),
+                         "Attachments are only listed by name in the emails file.")
+        form.docs_var.set("")
+        self.assertIn("no documents file is made", form.attachments_hint.cget("text"))
+
+    def test_documents_folder_is_counted(self):
+        folder = os.path.join(self.data_dir, "Reports")
+        for name in ("a.pdf", "b.docx", "c.dwg", os.path.join("Sub", "d.xlsx")):
+            os.makedirs(os.path.dirname(os.path.join(folder, name)), exist_ok=True)
+            with open(os.path.join(folder, name), "w") as fh:
+                fh.write("x")
+        app = self.open_app([projects.new_project("Alpha")])
+        hint = app.form.docs_hint
+        app.form.docs_var.set(folder)
+        app.start_docs_count()
+        self.assertTrue(self.wait_for(app, lambda: "found" in hint.cget("text")))
+        self.assertEqual(hint.cget("text"), "3 documents found (incl. subfolders) - plus 1 other "
+                                            "file, listed by name only.")
+        self.assertEqual(hint.cget("style"), "Good.TLabel")
+        app.form.docs_subfolders_var.set(False)
+        app.start_docs_count()
+        self.assertTrue(self.wait_for(app, lambda: "this folder only" in hint.cget("text")))
+        self.assertTrue(hint.cget("text").startswith("2 documents found"))
+        # A missing folder never stops a run: a warning, not an error.
+        app.form.docs_var.set(os.path.join(folder, "gone"))
+        app.start_docs_count()
+        self.assertTrue(self.wait_for(app, lambda: "Can't find" in hint.cget("text")))
+        self.assertEqual(hint.cget("style"), "Warn.TLabel")
+        # The output folder is never read for documents.
+        app.form.source_var.set(os.path.join(self.data_dir, "Emails"))
+        app.form.output_var.set(folder)
+        app.form.docs_var.set(folder)
+        app.start_docs_count()
+        self.assertIn("where the digests are saved", hint.cget("text"))
+        self.assertEqual(hint.cget("style"), "Warn.TLabel")
+        self.start_without_engine(app, app.start_run)    # ... but it doesn't stop Squish!
+        self.assertIsNotNone(app.run)
+        app.run = None
+
+    def test_pdf_reader_line(self):
+        app = self.open_app([projects.new_project("Alpha")])
+        hint = app.form.pdf_hint
+        app.pdf_status = None
+        app.form.set_hint(hint, gui.PDF_CHECKING)
+        self.assertEqual(hint.cget("text"), "checking...")
+        app.handle_message(("pdf_backend", "PDF: pypdf 5.1.0"))
+        self.assertEqual(hint.cget("text"), "pypdf 5.1.0")
+        app.handle_message(("pdf_backend", "PDF: built-in reader (install pypdf for best results)"))
+        self.assertEqual(hint.cget("text"), gui.PDF_ADVICE)
+        with mock.patch.object(gui.messagebox, "showinfo") as about:
+            app.show_about()
+        self.assertIn("PDF: built-in reader", about.call_args[0][1])
+
+    def test_compact_layout_keeps_the_document_count_and_pdf_line(self):
+        app = self.open_app([projects.new_project("Alpha")], compact=True)
+        form = app.form
+        self.assertEqual(form.attachments_hint.winfo_manager(), "")   # a plain hint
+        self.assertEqual(form.docs_hint.winfo_manager(), "grid")
+        self.assertEqual(form.pdf_hint.winfo_manager(), "grid")
+
+    def test_run_gets_the_document_settings(self):
+        a = projects.new_project("Alpha")
+        a["source_folder"] = self.data_dir
+        a["docs_folder"] = os.path.join(self.data_dir, "Reports")
+        a["docs_from_attachments"] = False
+        app = self.open_app([a])
+        seen = {}
+
+        def fake_run(run_id, project, cancel, post):
+            seen.update(project)
+
+        with mock.patch.object(gui, "run_in_background", side_effect=fake_run):
+            app.start_run()
+            deadline = time.time() + 5
+            while not seen and time.time() < deadline:
+                time.sleep(0.01)
+        self.assertEqual((seen["docs_folder"], seen["docs_from_attachments"],
+                          seen["docs_include_subfolders"]), (a["docs_folder"], False, True))
+        app.run = None
+
+    def test_documents_stage_progress_and_cancel(self):
+        a = projects.new_project("Alpha")
+        app = self.open_app([a])
+        self.fake_run(app, a)
+        app._show_progress(1, "documents", 12, 64, "Reading documents... 12 of 64")
+        self.assertEqual(app.status.cget("text"), "Condensing documents 12 of 64...")
+        self.assertEqual(str(app.progress.cget("mode")), "determinate")
+        self.assertEqual(float(app.progress.cget("value")), 12.0)
+        app._show_progress(1, "documents", 1, 1, "Found 70 documents")
+        self.assertEqual(app.status.cget("text"), "Found 70 documents")
+        app._show_progress(1, "documents", 3, 64, "")
+        app.cancel_run()
+        self.assertIn("documents", app.status.cget("text"))
+        app._run_finished()
+
+    def test_results_table_shows_emails_and_documents_files(self):
+        a = projects.new_project("Alpha")
+        app = self.open_app([a])
+        out = os.path.join(self.data_dir, "out")
+        emails = dict(DocumentHelperTests.EMAILS,
+                      path=os.path.join(out, "Squish - Alpha - 2024-08-22 to 2025-11-30.txt"),
+                      bytes=430000, first_date="2024-08-22", last_date="2025-11-30")
+        docs = dict(DocumentHelperTests.DOCS,
+                    path=os.path.join(out, "Squish - Alpha - documents - 2024-08-22 to "
+                                           "2025-11-30.txt"),
+                    bytes=150000, first_date="2024-08-22", last_date="2025-11-30")
+        self.fake_run(app, a)
+        app._run_done(1, {"files": [emails, docs], "elapsed_s": 4, "output_folder": out,
+                          "files_found": 2000, "failed": [], "doc_problems": [],
+                          "stats": {"emails_used": 1876, "threads": 200, "documents": 64,
+                                    "doc_drawings": 9, "doc_other": 31}})
+        tree = app.results.tree
+        rows = [tree.item(i, "values") for i in tree.get_children()]
+        self.assertEqual([r[1] for r in rows], ["Emails", "Documents"])
+        self.assertEqual([r[-1] for r in rows], ["1,876 emails", "64 documents"])
+        self.assertEqual(rows[1][0], "documents - 2024-08-22 to 2025-11-30.txt")
+        self.assertEqual(tree.selection(), ("0",))      # the emails file is picked first
+        self.assertIn("73 documents condensed", app.results.summary.cget("text"))
+        self.assertIn("add the documents file when you need what the attachments say",
+                      app.status.cget("text"))
+        self.assertEqual(app.status.cget("style"), "StatusGood.TLabel")
+        # A documents folder that couldn't be read makes the Done message amber.
+        self.fake_run(app, a)
+        app._run_done(1, {"files": [emails, docs], "elapsed_s": 4, "failed": [], "stats": {},
+                          "doc_problems": [["H:\\Reports", "documents folder not found: VPN?"]]})
+        self.assertEqual(app.status.cget("style"), "StatusWarn.TLabel")
+        # Shown again later (from the saved last_run): the same table.
+        app.select_project(a["id"])
+        rows = [tree.item(i, "values") for i in tree.get_children()]
+        self.assertEqual([r[1] for r in rows], ["Emails", "Documents"])
+
+    def test_file_column_fits_a_small_window(self):
+        app = self.open_app([projects.new_project("Alpha")], compact=True)
+        app.root.geometry("980x560")
+        app.root.update()
+        tree = app.results.tree
+        total = sum(int(tree.column(c, "width")) for c in tree["columns"])
+        self.assertLessEqual(total, tree.winfo_width())
 
     # ---- closing ------------------------------------------------------------------
 

@@ -1,4 +1,7 @@
 # Squish needs only Python 3.8+ (with tkinter, which python.org Python includes).
-# This package is OPTIONAL: it reads Outlook .msg files a little better.
-# Without it, Squish uses its own built-in reader. "Install Squish.bat" installs it for you.
+# These packages are OPTIONAL. "Install Squish.bat" installs them for you; without
+# them Squish uses its own built-in readers.
+# extract-msg: reads Outlook .msg files a little better.
 extract-msg
+# pypdf: reads the text of PDF documents (attachments and the documents folder) better.
+pypdf

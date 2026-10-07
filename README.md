@@ -14,6 +14,10 @@ You drag that file into Claude and ask things like *"What's still outstanding,
 and who owes it?"* A big project may give a few files: **start a new Claude chat
 for each file** (Squish tells you when they are small enough to share one chat).
 
+Squish also condenses the **Word, Excel, PowerPoint and PDF documents** attached
+to the emails (and, if you like, a folder of reports) into a second, separate file -
+see [Documents](#documents).
+
 You can set up as many projects as you like; Squish remembers each one.
 
 ---
@@ -31,8 +35,8 @@ You can set up as many projects as you like; Squish remembers each one.
    `.bat` files.
 2. **Double-click `Install Squish.bat`.** It:
    - checks that Python is installed,
-   - installs an optional helper for reading Outlook files (if your network
-     blocks this, that's fine - Squish has its own reader built in),
+   - installs optional helpers for reading Outlook files and PDFs (if your
+     network blocks this, that's fine - Squish has its own readers built in),
    - puts a **Squish** shortcut on your Desktop and in the Start Menu,
    - offers to open Squish.
 
@@ -68,7 +72,9 @@ Python itself.
    found. Leave *Include subfolders* ticked for a folder of folders.
 3. Click **Squish!** (or press F5). A progress bar shows how it's going. The
    first run of a big folder on a network drive can take a few minutes; after
-   that Squish remembers what it has read, so re-runs are much quicker.
+   that Squish remembers what it has read, so re-runs are much quicker. (The
+   first run after updating from Squish 1.0 reads every email again, because it
+   now reads the attached documents too.)
 4. **Give the file to Claude**, either way:
    - click **Show in folder** and drag the file into the Claude window, or
    - click **Copy file**, click in Claude's message box and press **Ctrl+V**.
@@ -87,6 +93,49 @@ kept.
 
 Settings save automatically. Deleting a project only removes it from Squish's
 list - it never deletes emails or digest files.
+
+---
+
+## Documents
+
+Emails often say little more than "see attached". So Squish also reads the
+**documents** - Word, Excel, PowerPoint and PDF files, plus text, CSV and zip
+files - and condenses them into a **separate documents file** next to the email
+digest (its name has `documents` in it). The emails file stays small; you add the
+documents file only when you need it.
+
+Two switches, on the **Documents** tab of each project:
+
+- **Condense Word, Excel, PowerPoint and PDF attachments** - the files attached to
+  the emails (on by default). A file attached to many emails is included once.
+- **Documents folder** (optional) - also condense the files in a folder, for
+  example the project's `04 Reports` folder. Squish shows how many documents it
+  found there.
+
+Long documents keep their headings and the sentences and table rows with figures,
+dates and requirements; a later revision of a report shows only what changed
+from the earlier one. Drawings get one line each (title and revision). In the
+email file, an attachment that is in the documents file is marked with its
+number, e.g. `[att: Geotech report.pdf =D12]`, so Claude can match them up.
+
+**Not read** (listed by name only, so Claude knows they exist): old `.doc`,
+`.xls` and `.ppt` files (save them as `.docx`, `.xlsx` or `.pptx` if you need
+them), scanned PDFs that have no text in them, CAD files, and anything on a
+drawing beyond its title block.
+
+**Drag in the emails file first; add the documents file when you need what the
+attachments say.** Then try:
+
+- *"Using the emails and documents digests, list every requirement in the
+  geotech report and whether the emails show it was addressed."*
+- *"Compare Rev B and Rev C of the drainage report. What changed, and did anyone
+  email about the change?"*
+- *"Which documents did the client send us, and which of them have we not
+  replied to?"*
+
+The squeeze level, file size, dates and focus keywords apply to the documents
+file too (except that the dates don't apply to the documents folder: its files
+have no email date).
 
 ---
 
@@ -171,6 +220,12 @@ log** for the list. Usually these are damaged or unusual files; the rest of the
 digest is still fine, and its header tells Claude how many files couldn't be
 read.
 
+**Some documents couldn't be read.** Usually these are scanned PDFs (pictures of
+pages, with no text in them) or password-protected files. They are listed by
+name in the documents file; **View run log** gives the reason for each. Some
+PDFs are only locked against editing; Squish can read the older kind of those
+when the optional pypdf helper is installed (run `Install Squish.bat` again).
+
 **Very long folder paths** (over 260 characters) are handled - Squish uses
 Windows' long-path support when reading.
 
@@ -198,7 +253,8 @@ should have access, sort that out and run it again.
 ## For the curious
 
 - Squish needs Python 3.8 or newer with tkinter (included in the python.org
-  installer). The optional `extract-msg` package is listed in `requirements.txt`.
+  installer). The optional `extract-msg` (Outlook files) and `pypdf` (PDFs)
+  packages are listed in `requirements.txt`.
 - Settings live in `%APPDATA%\Squish` (*Tools > Open data folder*); run logs,
   crash reports and the read cache live in `%LOCALAPPDATA%\Squish` (*Tools >
   Open logs folder*), so they don't roam with your Windows profile.
@@ -206,5 +262,7 @@ should have access, sort that out and run it again.
   file names (the end becomes a short code such as `~3f9a1c`), to keep paths
   within Windows' limits.
 - It can also run without its window:
-  `python Squish.pyw run "Project name"` or `python Squish.pyw list`.
+  `python Squish.pyw run "Project name"` or `python Squish.pyw list`
+  (`--no-docs` leaves the attachments out, `--docs-folder DIR` adds a
+  documents folder for that run).
 - How it works, for maintainers: see `DESIGN.md`.

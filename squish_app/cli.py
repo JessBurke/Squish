@@ -4,7 +4,12 @@
     python Squish.pyw run --source DIR [--out DIR] [--name NAME] [--squeeze standard]
                           [--part-size medium] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
                           [--keywords "a,b"] [--org "slrconsulting.com=SLR"] [--no-subfolders]
+                          [--no-docs] [--docs-folder DIR]
     python Squish.pyw list                           list saved projects
+
+Documents attached to the emails are condensed into a separate documents
+digest unless --no-docs is given; --docs-folder adds the loose documents in a
+folder (both also work with a saved project, for that run only).
 
 Options given with a saved project apply to that run only (they are not saved).
 --source, --name and --no-subfolders can't be combined with a saved project name
@@ -75,6 +80,11 @@ def build_parser():
                      help='organisation codes, e.g. "slrconsulting.com=SLR" (repeat or comma-separate)')
     run.add_argument("--no-subfolders", dest="no_subfolders", action="store_true",
                      help="only read the top folder (not with a saved project)")
+    run.add_argument("--no-docs", dest="no_docs", action="store_true",
+                     help="don't condense the documents attached to the emails")
+    run.add_argument("--docs-folder", dest="docs_folder", metavar="DIR",
+                     help="also condense the documents (Word, Excel, PowerPoint, PDF) "
+                          "in this folder")
 
     sub.add_parser("list", help="list saved projects")
     return parser
@@ -186,6 +196,11 @@ def _project_from_args(args):
         project["org_codes"] = _org_lines(args.org)
     if args.no_subfolders:
         project["include_subfolders"] = False
+    if args.no_docs:
+        project["docs_from_attachments"] = False
+    if args.docs_folder is not None:
+        folder = paths.clean_folder_text(args.docs_folder)
+        project["docs_folder"] = os.path.abspath(folder) if folder else ""
     return project, ""
 
 
@@ -227,6 +242,7 @@ def _format_summary(project, result):
                      % (stats.get("emails_in", 0), stats.get("emails_used", 0),
                         stats.get("duplicates", 0), stats.get("noise_dropped", 0),
                         stats.get("outside_dates", 0)))
+    lines.extend(_documents_lines(result))
     if files:
         lines.append("Wrote %d file(s) to %s" % (len(files), result.get("output_folder", "")))
         for f in files:
@@ -245,6 +261,33 @@ def _format_summary(project, result):
         lines.append("Run log: %s" % result["log_path"])
     lines.append("Took %.1f s" % result.get("elapsed_s", 0.0))
     return "\n".join(lines)
+
+
+def _plural(n, word):
+    return "%d %s%s" % (n, word, "" if n == 1 else "s")
+
+
+def _documents_lines(result):
+    """Summary lines about the documents digest ([] when there were no documents)."""
+    stats = result.get("stats") or {}
+    problems = result.get("doc_problems") or []
+    lines = []
+    counts = [(stats.get("documents") or 0, "document"),
+              (stats.get("doc_drawings") or 0, "drawing"),
+              (stats.get("doc_other") or 0, "other file")]
+    if any(n for n, _word in counts):
+        text = ", ".join(_plural(n, word) for n, word in counts if n)
+        versions = stats.get("doc_versions") or 0
+        if versions:
+            text += " (%s shown as changes)" % _plural(versions, "later version")
+        lines.append("Documents: %s" % text)
+    folders = [p for p in problems if engine.is_doc_folder_problem(p[1])]
+    for folder, message in folders:
+        lines.append("Documents folder %s: %s" % (folder, message))
+    unread = len(problems) - len(folders)
+    if unread:
+        lines.append("%s could not be read (see the run log)" % _plural(unread, "document"))
+    return lines
 
 
 def _saved_project_conflict(args):

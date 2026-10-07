@@ -31,6 +31,13 @@ attachment has "email": None.
 extract-msg's slow RTF de-encapsulation (RTFDE) is switched off; an RTF-only
 body is converted by msgfile's own converter, whichever reader is used.
 
+Documents (v1.1): with ``read_email(path, want_docs=True)`` the bytes of
+attachments that docs.py can condense (a supported extension, at most
+docs.DOC_MAX_BYTES) are kept in a transient "_data" entry, plus "sha1" (of the
+bytes) and "doc_size". The engine hands "_data" to docs.extract and removes it
+before the record is cached; it is never written anywhere. Attachments of an
+attached email are not read (one level only).
+
 Set the environment variable SQUISH_NO_EXTRACT_MSG=1 to always use the
 built-in .msg reader (handy for troubleshooting).
 """
@@ -39,6 +46,7 @@ import email
 import email.parser
 import email.policy
 import email.utils
+import hashlib
 import logging
 import mimetypes
 import os
@@ -48,7 +56,7 @@ from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
 
-from . import msgfile
+from . import docs, msgfile
 from .paths import long_path, short_path
 
 SUPPORTED_EXTENSIONS = (".msg", ".eml")
@@ -103,18 +111,48 @@ def backend_status():
 # Public entry point
 # --------------------------------------------------------------------------
 
-def read_email(path):
+def read_email(path, want_docs=False):
     """Read a .msg or .eml file and return an EmailRecord dict.
+
+    With ``want_docs``, attachments that are documents (see wants_doc_data) get
+    "_data" (their bytes, for the engine to condense and then remove), "sha1"
+    and "doc_size".
 
     Raises an exception (with a readable message) if the file can't be read.
     """
     display = os.path.abspath(short_path(str(path)))
     ext = os.path.splitext(display)[1].lower()
     if ext == ".msg":
-        return _clean_strings(_read_msg(display))
-    if ext == ".eml":
-        return _clean_strings(_read_eml(display))
-    raise ValueError("not an email file (expected .msg or .eml): %s" % display)
+        rec = _read_msg(display, want_docs)
+    elif ext == ".eml":
+        rec = _read_eml(display, want_docs)
+    else:
+        raise ValueError("not an email file (expected .msg or .eml): %s" % display)
+    rec = _clean_strings(rec)
+    _take_doc_data(rec, want_docs)
+    return rec
+
+
+def wants_doc_data(name, size):
+    """True for an attachment whose bytes are kept for docs.extract: a supported
+    document type (Word, Excel, PowerPoint, PDF, text, zip) of at most
+    docs.DOC_MAX_BYTES."""
+    return (docs.is_supported(name or "") and isinstance(size, int)
+            and 0 <= size <= docs.DOC_MAX_BYTES)
+
+
+def _take_doc_data(rec, want_docs):
+    """Remove the raw "data" the readers left on attachments. With
+    ``want_docs``, each document attachment keeps its bytes as "_data", plus
+    "sha1" and "doc_size"; the bytes of everything else (inline images, the
+    S/MIME container) are dropped."""
+    for att in rec["attachments"]:
+        data = att.pop("data", None)
+        if (want_docs and isinstance(data, bytes) and not att["inline"]
+                and att.get("email") is None and wants_doc_data(att["name"], len(data))):
+            att["_data"] = data
+            att["sha1"] = hashlib.sha1(data).hexdigest()
+            att["doc_size"] = len(data)
 
 
 def _empty_record(path, reader):
@@ -659,34 +697,38 @@ def is_auto_reply(item_class, subject, get_header):
 # .msg files
 # --------------------------------------------------------------------------
 
-def _read_msg(display):
+def _read_msg(display, want_docs=False):
     """Read a .msg: extract-msg first (if installed and the file is not big),
-    else the built-in reader; whichever was not tried first is the fallback."""
+    else the built-in reader; whichever was not tried first is the fallback.
+    With ``want_docs`` the readers also keep the bytes of document attachments
+    (raw "data"; read_email turns it into "_data")."""
     path = long_path(display)
     module = _get_extract_msg()
     try:
         big = os.path.getsize(path) > EXTRACT_MSG_MAX_BYTES
     except OSError:
         big = False
+    # Only pass the extra argument when it is needed (keeps the plain call unchanged).
+    extra = {"want_data": wants_doc_data} if want_docs else {}
     eight_bit = False
     if module is not None and not big:
         try:
-            fields = _fields_via_extract_msg(module, path)
-            return _record_from_msg_fields(display, fields, READER_EXTRACT_MSG)
+            fields = _fields_via_extract_msg(module, path, **extra)
+            return _record_from_msg_fields(display, fields, READER_EXTRACT_MSG, want_docs)
         except _EightBitMessage:
             eight_bit = True   # the built-in reader reads 8-bit text better
         except Exception:
             pass  # fall back to the built-in reader below
     try:
-        fields = msgfile.read_msg(path)
-        return _record_from_msg_fields(display, fields, READER_BUILTIN_MSG)
+        fields = msgfile.read_msg(path, **extra)
+        return _record_from_msg_fields(display, fields, READER_BUILTIN_MSG, want_docs)
     except Exception as exc:
         if module is None or not (big or eight_bit):
             raise
         first_error = exc
     try:
-        fields = _fields_via_extract_msg(module, path, allow_8bit=True)
-        return _record_from_msg_fields(display, fields, READER_EXTRACT_MSG)
+        fields = _fields_via_extract_msg(module, path, allow_8bit=True, **extra)
+        return _record_from_msg_fields(display, fields, READER_EXTRACT_MSG, want_docs)
     except Exception:
         raise first_error
 
@@ -775,8 +817,11 @@ def _address_book(get_raw_header):
     return book
 
 
-def _record_from_msg_fields(display, f, reader):
-    """Turn the raw fields of a .msg (from either reader) into an EmailRecord."""
+def _record_from_msg_fields(display, f, reader, want_docs=False):
+    """Turn the raw fields of a .msg (from either reader) into an EmailRecord.
+
+    Attachments whose bytes the reader kept get them as raw "data" (read_email
+    keeps or drops it); ``want_docs`` is passed on to an S/MIME email's MIME."""
     rec = _empty_record(display, reader)
     headers = _parse_transport_headers(f.get("headers") or "")
     get_header = _header_getter(headers)
@@ -867,16 +912,19 @@ def _record_from_msg_fields(display, f, reader):
                 attached = _attached_email(_record_from_msg_fields(display, a["message"], reader))
             except Exception:
                 attached = None  # an unreadable attached email: keep its name only
-        rec["attachments"].append({
+        entry = {
             "name": aname,
             "size": int(size) if isinstance(size, int) else None,
             "inline": inline,
             "email": attached,
-        })
+        }
+        if isinstance(a.get("data"), bytes) and not a.get("embedded"):
+            entry["data"] = a["data"]   # raw bytes; read_email keeps documents' only
+        rec["attachments"].append(entry)
 
     rec["auto_reply"] = is_auto_reply(rec["item_class"], rec["subject"], get_header)
     rec["meeting"] = _meeting_from_fields(f, rec["item_class"])
-    _unpack_signed_msg(rec, f)
+    _unpack_signed_msg(rec, f, want_docs)
     return rec
 
 
@@ -910,7 +958,7 @@ def _meeting_from_fields(f, item_class):
             "location": _one_line(f.get("meeting_location"))}
 
 
-def _unpack_signed_msg(rec, f):
+def _unpack_signed_msg(rec, f, want_docs=False):
     """Clear-signed S/MIME email (IPM.Note.SMIME...): Outlook keeps the text and
     the real attachments as MIME inside one smime.p7m attachment. Take the body
     and attachments from there; the .msg's own sender, date etc. are kept.
@@ -933,7 +981,8 @@ def _unpack_signed_msg(rec, f):
         inner = email.message_from_bytes(data, policy=email.policy.default)
         if not inner.get_content_type().startswith("multipart/"):
             return  # opaque-signed or encrypted: can't be read without keys/ASN.1
-        unpacked = _record_from_eml_message(inner, rec["path"], rec["reader"])
+        unpacked = _record_from_eml_message(inner, rec["path"], rec["reader"],
+                                            want_docs=want_docs)
     except Exception:
         return
     if unpacked["body"].strip() or unpacked["attachments"]:
@@ -1037,14 +1086,15 @@ class _EightBitMessage(ValueError):
     its text better, so the whole file is handed to it."""
 
 
-def _fields_via_extract_msg(module, path, allow_8bit=False):
+def _fields_via_extract_msg(module, path, allow_8bit=False, want_data=None):
     """Read a .msg with extract-msg into the same raw fields msgfile produces.
 
     An 8-bit message raises _EightBitMessage unless ``allow_8bit`` (used only
-    when the built-in reader has already failed on the file)."""
+    when the built-in reader has already failed on the file). ``want_data`` is
+    as for msgfile.read_msg."""
     msg = _open_with_extract_msg(module, path)
     try:
-        return _em_message_fields(msg, allow_8bit=allow_8bit)
+        return _em_message_fields(msg, allow_8bit=allow_8bit, want_data=want_data)
     finally:
         try:
             msg.close()
@@ -1052,12 +1102,13 @@ def _fields_via_extract_msg(module, path, allow_8bit=False):
             pass
 
 
-def _em_message_fields(msg, nested=False, allow_8bit=False):
+def _em_message_fields(msg, nested=False, allow_8bit=False, want_data=None):
     """The raw fields (as msgfile produces them) of an open extract-msg message.
 
     ``nested`` is True for an email attached to the filed email: then its
     meeting details are not read and its own attached emails get their name
-    only (as in msgfile, one level of attached emails is read).
+    only (as in msgfile, one level of attached emails is read). ``want_data``
+    (not used for nested emails) is as for msgfile.read_msg.
     """
     if not hasattr(msg, "recipients") or not hasattr(msg, "body"):
         raise ValueError("not an email item")  # e.g. a contact: use the built-in reader
@@ -1113,7 +1164,8 @@ def _em_message_fields(msg, nested=False, allow_8bit=False):
 
     any_cid = False
     for att in _em_call(lambda: msg.attachments, []) or []:
-        a = _em_attachment(att, read_message=not nested, allow_8bit=allow_8bit)
+        a = _em_attachment(att, read_message=not nested, allow_8bit=allow_8bit,
+                           want_data=None if nested else want_data)
         any_cid = any_cid or bool(a["content_id"])
         f["attachments"].append(a)
 
@@ -1140,11 +1192,12 @@ def _em_message_fields(msg, nested=False, allow_8bit=False):
     return f
 
 
-def _em_attachment(att, read_message=True, allow_8bit=False):
+def _em_attachment(att, read_message=True, allow_8bit=False, want_data=None):
     """One extract-msg attachment -> the raw attachment dict msgfile produces.
 
     For an attached email, "message" holds its fields when ``read_message`` is
-    True (attachments of the filed email itself), else None.
+    True (attachments of the filed email itself), else None. "data" holds the
+    bytes of a file attachment that ``want_data(name, size)`` asks for, else None.
     """
     att_type = _em_call(lambda: att.type)
     type_name = str(getattr(att_type, "name", att_type) or "").lower()
@@ -1172,6 +1225,11 @@ def _em_attachment(att, read_message=True, allow_8bit=False):
     if not isinstance(size, int) and not embedded:
         data = _em_call(lambda: att.data)
         size = len(data) if isinstance(data, bytes) else None
+    data = None
+    if want_data is not None and not embedded:
+        raw = _em_call(lambda: att.data)   # extract-msg already holds it in memory
+        if isinstance(raw, bytes) and want_data(str(name or "").strip(), len(raw)):
+            data = raw
     return {
         "name": str(name or "").strip(),
         "size": size if isinstance(size, int) else None,
@@ -1182,6 +1240,7 @@ def _em_attachment(att, read_message=True, allow_8bit=False):
         "method": _em_prop(att, "37050003") or 0,
         "embedded": embedded,
         "message": message,
+        "data": data,
     }
 
 
@@ -1307,19 +1366,21 @@ def _received_date(msg):
     return None
 
 
-def _read_eml(display):
+def _read_eml(display, want_docs=False):
     with open(long_path(display), "rb") as fh:
         data = fh.read()
     msg = email.message_from_bytes(data, policy=email.policy.default)
-    return _record_from_eml_message(msg, display, READER_EML)
+    return _record_from_eml_message(msg, display, READER_EML, want_docs=want_docs)
 
 
-def _record_from_eml_message(msg, display, reader, depth=0):
+def _record_from_eml_message(msg, display, reader, depth=0, want_docs=False):
     """Build an EmailRecord from a parsed email.message.Message (.eml files,
     and the MIME inside a signed .msg).
 
     Attached emails (message/rfc822 parts) are read too when ``depth`` is 0;
-    an attached email's own attached emails get their name only.
+    an attached email's own attached emails get their name only. With
+    ``want_docs`` (depth 0 only), document attachments keep their decoded bytes
+    as raw "data" (see read_email).
     """
     rec = _empty_record(display, reader)
 
@@ -1406,6 +1467,7 @@ def _record_from_eml_message(msg, display, reader, depth=0):
                          "message/delivery-status", "message/disposition-notification"):
                 continue  # alternative bodies and report details, not attachments
         size = None
+        payload = None
         inner = None
         if ctype == "message/rfc822":
             try:
@@ -1421,7 +1483,8 @@ def _record_from_eml_message(msg, display, reader, depth=0):
                 filename = (inner_subject or "attached message") + ".eml"
         else:
             try:
-                size = len(part.get_payload(decode=True) or b"")
+                payload = part.get_payload(decode=True) or b""
+                size = len(payload)
             except Exception:
                 size = None
         if not filename:
@@ -1438,12 +1501,17 @@ def _record_from_eml_message(msg, display, reader, depth=0):
                                                                     depth=1))
             except Exception:
                 attached = None  # an unreadable attached email: keep its name only
-        rec["attachments"].append({
+        entry = {
             "name": name,
             "size": size,
             "inline": inline,
             "email": attached,
-        })
+        }
+        if (want_docs and depth == 0 and not inline and isinstance(payload, bytes)
+                and wants_doc_data(name, size)):
+            entry["data"] = payload
+        rec["attachments"].append(entry)
+        payload = None
 
     rec["item_class"] = item_class or "IPM.Note"
     rec["auto_reply"] = is_auto_reply(rec["item_class"], rec["subject"], get_header)

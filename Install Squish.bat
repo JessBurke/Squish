@@ -5,7 +5,7 @@ rem ----------------------------------------------------------------------
 rem  Squish - one-time setup. Double-click this file.
 rem
 rem  1. finds Python (the "py" launcher first, then "python")
-rem  2. installs the optional Outlook reader package (extract-msg)
+rem  2. installs the optional Outlook and PDF reader packages (extract-msg, pypdf)
 rem  3. makes the Squish shortcuts on the Desktop and in the Start Menu
 rem
 rem  Written with goto labels instead of bracketed if-blocks, so folder
@@ -23,7 +23,7 @@ echo  ============================================================
 echo.
 echo  This will:
 echo    1. check that Python is installed
-echo    2. install the optional Outlook reader (extract-msg)
+echo    2. install the optional Outlook and PDF readers (extract-msg, pypdf)
 echo    3. put a Squish shortcut on your Desktop and in the Start Menu
 echo.
 echo  Nothing is uploaded, and your emails are not touched.
@@ -80,12 +80,26 @@ echo  This can take a minute - and it's fine if it doesn't work...
 %PY% -m pip install --user --upgrade --disable-pip-version-check --quiet --timeout 20 --retries 1 extract-msg >"%TEMP%\squish-pip-log.txt" 2>&1
 if errorlevel 1 goto :pipfailed
 echo  Outlook reader installed.
-goto :shortcuts
+goto :pdfreader
 
 :pipfailed
 echo  Couldn't install it (no internet access, or blocked by IT). That's fine:
 echo  Squish will use its own built-in Outlook reader instead.
 echo  (The details are in squish-pip-log.txt in your Temp folder.)
+goto :pdfreader
+
+rem ---- 2b. Optional PDF reader ----------------------------------------------
+:pdfreader
+echo.
+echo  Installing the optional PDF reader (pypdf)...
+%PY% -m pip install --user --upgrade --disable-pip-version-check --quiet --timeout 20 --retries 1 pypdf >"%TEMP%\squish-pip-pdf-log.txt" 2>&1
+if errorlevel 1 goto :pdffailed
+echo  PDF support: installed
+goto :shortcuts
+
+:pdffailed
+echo  PDF support: Squish's built-in reader will be used
+echo  (Couldn't install pypdf - the details are in squish-pip-pdf-log.txt in your Temp folder.)
 goto :shortcuts
 
 rem ---- 3. Shortcuts ---------------------------------------------------------

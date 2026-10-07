@@ -613,29 +613,34 @@ _MAX_RTF_BYTES = 16 * 1024 * 1024
 _MAX_EMBED_DEPTH = 5
 
 
-def read_msg(path):
+def read_msg(path, want_data=None):
     """Read a .msg file and return its fields as a dict (see ``_read_message``).
 
     ``path`` is used as given (callers pass a long-path-safe string on Windows).
     A small file is read in one go; a big one is read in place, so only its
-    directory and property streams are read (attachment data is never
-    downloaded from the file server).
+    directory and property streams are read (attachment data is not
+    downloaded from the file server, except the attachments ``want_data``
+    asks for).
+
+    ``want_data(name, size)``, if given, is asked about each attachment of the
+    filed email (not of attached emails); when it returns True the attachment's
+    bytes are read into its "data" entry (used for documents, see docs.py).
     """
     with open(path, "rb", buffering=_READ_BUFFER) as f:
         size = os.fstat(f.fileno()).st_size
         if size <= _IN_MEMORY_LIMIT:
             data = f.read()
-            return read_msg_bytes(data)
-        return _read_message(CompoundFile(f, size), None, top_level=True)
+            return read_msg_bytes(data, want_data)
+        return _read_message(CompoundFile(f, size), None, top_level=True, want_data=want_data)
 
 
-def read_msg_bytes(data):
+def read_msg_bytes(data, want_data=None):
     """Like ``read_msg`` but for the bytes of a .msg file."""
     cf = CompoundFile(io.BytesIO(data), len(data))
-    return _read_message(cf, None, top_level=True)
+    return _read_message(cf, None, top_level=True, want_data=want_data)
 
 
-def _read_message(cf, storage, top_level=True, parent_codepage=None, depth=0):
+def _read_message(cf, storage, top_level=True, parent_codepage=None, depth=0, want_data=None):
     """Read the fields Squish needs from a message storage.
 
     Returns a dict:
@@ -656,7 +661,8 @@ def _read_message(cf, storage, top_level=True, parent_codepage=None, depth=0):
       (str): the meeting's own time and place, only for the top-level message of
       a meeting request, cancellation or appointment (None, None, "" otherwise).
     An attachment dict also has "data" (bytes) for the smime.p7m attachment of
-    a clear-signed S/MIME email (None for every other attachment), and
+    a clear-signed S/MIME email and for the attachments ``want_data(name,
+    size)`` asks for (depth 0 only; None for every other attachment), and
     "message": for an email attached to the filed email (depth 0 only), that
     email's own fields as returned here (its attached emails get their name
     only, never a "message"); None for every other attachment, or when the
@@ -749,6 +755,10 @@ def _read_message(cf, storage, top_level=True, parent_codepage=None, depth=0):
         if (smime and data_entry is not None and data_entry.size <= _MAX_SMIME_BYTES
                 and (name.strip().lower() == "smime.p7m" or mime == "multipart/signed")):
             data = cf.read(data_entry, max_bytes=_MAX_SMIME_BYTES)
+        elif (want_data is not None and depth == 0 and not embedded and data_entry is not None
+              and want_data(name.strip(), data_entry.size)):
+            # A document the caller wants (e.g. a PDF report): read just this stream.
+            data = _read_attachment_data(cf, data_entry)
         fields["attachments"].append({
             "name": name.strip(),
             "size": size,
@@ -779,6 +789,15 @@ def _read_message(cf, storage, top_level=True, parent_codepage=None, depth=0):
             except MsgFileError:
                 fields["rtf"] = None
     return fields
+
+
+def _read_attachment_data(cf, entry):
+    """The bytes of an attachment's data stream, or None if it can't be read
+    (a damaged attachment never stops the email being read)."""
+    try:
+        return cf.read(entry, max_bytes=entry.size)
+    except MsgFileError:
+        return None
 
 
 def _read_meeting(cf, props, fields):

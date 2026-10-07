@@ -1954,6 +1954,24 @@ def cap_text(text, limit, seen=""):
     return _render_units(text, units, keep)
 
 
+def fact_score(piece):
+    """How much a sentence or table row is worth keeping, as cap_text scores it
+    (0 = nothing in particular). Used by the documents digest too."""
+    return _fact_score(piece)
+
+
+def fact_pieces(text, size):
+    """(start, end) pieces of text as cap_text sees it: sentences, or table/list
+    runs that end at a fact; a piece over `size` characters that holds facts is
+    split further at its list items, then at clause breaks. For callers that
+    choose the pieces themselves (the documents digest)."""
+    units = _cap_units(text)
+    if not units:
+        return []
+    pieces, _whole = _fine_units(text, [(0, 0)] + units, size)
+    return [(a, b) for a, b in pieces[1:] if text[a:b].strip()]
+
+
 def _cut_at(text, limit):
     """Cut text at the last sentence (else list item, clause or word) before `limit`, then ' …'."""
     window = text[: limit + 1]

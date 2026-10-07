@@ -2,10 +2,12 @@
 
 build_digest(records, project, source_label="", now=None, outside_dates=0,
 cancel=None, progress=None, also_filed=None, no_access_emails=0,
-unreadable_files=0) is pure: no file
+unreadable_files=0, doc_ids=None) is pure: no file
 I/O, and the same input (and `now`) always gives the same output. It raises
 DigestCancelled when `cancel` (a threading.Event) is set, and calls
-progress(done, total) as it goes.
+progress(done, total) as it goes. doc_ids marks attachments with their
+documents digest ID ('report.pdf =D12'). alias_for_records(records, project)
+gives each record's sender alias (steps 1-7 only), for the documents digest.
 
 Steps:
   1. parse dates, clean every body (cleaning.clean_email; a Teams chat email
@@ -666,7 +668,7 @@ class DigestCancelled(Exception):
 
 
 def build_digest(records, project, source_label="", now=None, outside_dates=0, cancel=None, progress=None,
-                 also_filed=None, no_access_emails=0, unreadable_files=0):
+                 also_filed=None, no_access_emails=0, unreadable_files=0, doc_ids=None):
     """Turn EmailRecord dicts into digest parts. See DESIGN.md for the format.
 
     outside_dates: how many email files the engine's date filter left out (shown in
@@ -680,7 +682,13 @@ def build_digest(records, project, source_label="", now=None, outside_dates=0, c
     no_access_emails: how many emails the engine left out because Squish has no
     access to their folder (said in the header, like outside_dates).
     unreadable_files: how many email files the engine could not read (said in the
-    header, so Claude knows emails may be missing)."""
+    header, so Claude knows emails may be missing).
+    doc_ids: {(record path, attachment index): "D12"} for attachments whose
+    contents are in the documents digest: shown as 'name =D12' in [att: ...].
+    None (the default) leaves the digest exactly as without documents.
+
+    The result also has "aliases": {record path: sender alias} (see
+    alias_for_records), so the documents digest can show the same aliases."""
     project = project or {}
     total = len(records)
 
@@ -693,15 +701,114 @@ def build_digest(records, project, source_label="", now=None, outside_dates=0, c
         if progress is not None:
             progress(min(done, total), total)
 
-    level_key = project.get("squeeze") or DEFAULT_SQUEEZE
-    level = SQUEEZE_LEVELS.get(level_key, SQUEEZE_LEVELS[DEFAULT_SQUEEZE])
     size_key = project.get("part_size") or DEFAULT_PART_SIZE
     part_limit = PART_SIZES.get(size_key, PART_SIZES[DEFAULT_PART_SIZE])["chars"]
+    now = now or datetime.now()
+    found = _analyse(records, project, step, also_filed)
+    level, people, stats = found["level"], found["people"], found["stats"]
+    thread_list, keywords, recover = found["threads"], found["keywords"], found["recover"]
+    noise_counts = found["noise_counts"]
+
+    # 8. render ----------------------------------------------------------------
+    blocks = []
+    for th in thread_list:
+        block = _render_thread(th, people, level, stats, doc_ids)
+        if block["entries"]:
+            blocks.append(block)
+    stats["threads"] = len(blocks)
+    stats["emails_used"] = sum(b["emails"] for b in blocks)
+
+    all_dates = [d for b in blocks for d in b["span_dates"]]     # recovered emails' dates included
+    first_date = min(all_dates).strftime("%Y-%m-%d") if all_dates else ""
+    last_date = max(all_dates).strftime("%Y-%m-%d") if all_dates else ""
+
+    header_info = {
+        "name": project.get("name") or "Emails",
+        "source": source_label or "",
+        "squeeze": level["key"],
+        "made": now.strftime("%Y-%m-%d %H:%M"),
+        "first": first_date, "last": last_date,
+        "emails": stats["emails_used"], "threads": stats["threads"],
+        "dropped": _dropped_text(stats, noise_counts, level),
+        "date_filter": _date_filter_text(project, outside_dates),
+        "no_access": _no_access_text(no_access_emails),
+        "unreadable": _unreadable_text(unreadable_files),
+        "keywords": keywords,
+        "recover": recover, "ack": level["ack"],
+        "doc_ids": bool(doc_ids),
+    }
+
+    def check():
+        """Stop when the run is cancelled (called while the parts are packed)."""
+        if cancel is not None and cancel.is_set():
+            raise DigestCancelled()
+
+    parts = _split_parts(blocks, part_limit, header_info, people, check)
+    stats["output_chars"] = sum(len(p["text"]) for p in parts)
+    if progress is not None:
+        progress(total, total)
+    return {"parts": parts, "stats": stats, "aliases": _path_aliases(records, found)}
+
+
+def alias_for_records(records, project, also_filed=None):
+    """{record path: sender alias} exactly as build_digest shows the senders
+    ('SLR.AC'), for the documents digest's 'From:' lines. Copies dropped as
+    duplicates get the alias of the copy that is shown; a sender the email
+    digest never shows (e.g. left out by the focus keywords) gets an alias of
+    the same kind that no shown person has; '?' when nothing is known.
+    Pass the same records (and also_filed) as to build_digest. build_digest's
+    result has the same mapping under "aliases", without a second pass."""
+    found = _analyse(records, project or {}, lambda done: None, also_filed)
+    return _path_aliases(records, found)
+
+
+def _path_aliases(records, found):
+    """The mapping alias_for_records describes, from _analyse's result."""
+    people = found["people"]
+    taken = set(a.lower() for a in people.alias.values())
+    extra = {}
+
+    def alias_of(ident):
+        if not ident:
+            return "?"
+        if ident in people.alias:
+            return people.alias[ident]
+        if ident not in extra:
+            org, name, _ = people.info(ident)
+            for cand in _alias_candidates(name):
+                alias = org + "." + cand
+                if alias.lower() not in taken:
+                    break
+            taken.add(alias.lower())
+            extra[ident] = alias
+        return extra[ident]
+
+    out = {}
+    for it in found["shown"]:
+        alias = alias_of(it["from"])
+        for x in [it] + it.get("copies", []):
+            out.setdefault(x["rec"].get("path") or "", alias)
+    for rec in records:
+        path = rec.get("path") or ""
+        if path not in out:
+            out[path] = alias_of(people.identity(rec.get("sender_name"), rec.get("sender_email")))
+    return out
+
+
+def _analyse(records, project, step, also_filed=None):
+    """Steps 1-7 of build_digest (everything before the threads are rendered):
+    clean, drop duplicates and noise, learn who is who, thread, apply the focus
+    keywords, recover quoted emails and give people their aliases. step(done)
+    is called as the emails are handled (see build_digest). Returns a dict:
+    level, people, stats, noise_counts, threads (after the focus keywords),
+    shown (their emails), keywords and recover."""
+    total = len(records)
+    level_key = project.get("squeeze") or DEFAULT_SQUEEZE
+    level = SQUEEZE_LEVELS.get(level_key, SQUEEZE_LEVELS[DEFAULT_SQUEEZE])
     org_map = parse_org_codes(project.get("org_codes", ""))
     drop_noise = project.get("drop_noise", True)
     recover = bool(project.get("recover_quoted", True)) and level["recover"]
     keywords = cleaning.keyword_list(project.get("focus_keywords", ""))
-    now = now or datetime.now()
 
     stats = {"emails_in": len(records), "emails_used": 0, "duplicates": 0, "noise_dropped": 0,
              "acks_dropped": 0, "filtered_out": 0, "threads": 0, "recovered_quoted": 0,
@@ -725,7 +832,7 @@ def build_digest(records, project, source_label="", now=None, outside_dates=0, c
         if mid:
             if mid in best_by_mid:
                 stats["duplicates"] += 1
-                best_by_mid[mid] = _better_copy(best_by_mid[mid], it)
+                best_by_mid[mid] = _keep_copy(best_by_mid[mid], it)
                 continue
             best_by_mid[mid] = it
         rest.append(it)
@@ -772,7 +879,7 @@ def build_digest(records, project, source_label="", now=None, outside_dates=0, c
                 break
         if match is not None:
             stats["duplicates"] += 1
-            kept[match] = _better_copy(kept[match], it)
+            kept[match] = _keep_copy(kept[match], it)
         else:
             groups.setdefault(key, []).append((when, rcpts, len(kept)))
             kept.append(it)
@@ -971,44 +1078,8 @@ def build_digest(records, project, source_label="", now=None, outside_dates=0, c
     used = set(i for i in people.uses if i)
     people.assign_aliases(used)
 
-    # 8. render ----------------------------------------------------------------
-    blocks = []
-    for th in thread_list:
-        block = _render_thread(th, people, level, stats)
-        if block["entries"]:
-            blocks.append(block)
-    stats["threads"] = len(blocks)
-    stats["emails_used"] = sum(b["emails"] for b in blocks)
-
-    all_dates = [d for b in blocks for d in b["span_dates"]]     # recovered emails' dates included
-    first_date = min(all_dates).strftime("%Y-%m-%d") if all_dates else ""
-    last_date = max(all_dates).strftime("%Y-%m-%d") if all_dates else ""
-
-    header_info = {
-        "name": project.get("name") or "Emails",
-        "source": source_label or "",
-        "squeeze": level["key"],
-        "made": now.strftime("%Y-%m-%d %H:%M"),
-        "first": first_date, "last": last_date,
-        "emails": stats["emails_used"], "threads": stats["threads"],
-        "dropped": _dropped_text(stats, noise_counts, level),
-        "date_filter": _date_filter_text(project, outside_dates),
-        "no_access": _no_access_text(no_access_emails),
-        "unreadable": _unreadable_text(unreadable_files),
-        "keywords": keywords,
-        "recover": recover, "ack": level["ack"],
-    }
-
-    def check():
-        """Stop when the run is cancelled (called while the parts are packed)."""
-        if cancel is not None and cancel.is_set():
-            raise DigestCancelled()
-
-    parts = _split_parts(blocks, part_limit, header_info, people, check)
-    stats["output_chars"] = sum(len(p["text"]) for p in parts)
-    if progress is not None:
-        progress(total, total)
-    return {"parts": parts, "stats": stats}
+    return {"level": level, "people": people, "stats": stats, "noise_counts": noise_counts,
+            "threads": thread_list, "shown": shown, "keywords": keywords, "recover": recover}
 
 
 def _split_conversations(th, people):
@@ -1256,6 +1327,15 @@ def _attached_candidates(attached, people, filed):
             writer = people.identity(prev["sender_name"], prev["sender_email"])
         out.append((q, writer, hours))
     return out
+
+
+def _keep_copy(a, b):
+    """_better_copy of two copies of one email; the other copy is remembered
+    under the kept one's "copies" (so its path gets the same sender alias)."""
+    best = _better_copy(a, b)
+    other = b if best is a else a
+    best.setdefault("copies", []).extend([other] + other.pop("copies", []))
+    return best
 
 
 def _better_copy(a, b):
@@ -1516,10 +1596,10 @@ def _cap_with_inline(text, extra, cap, seen=""):
     return (text + " [inline replies: " + extra + "]").strip()
 
 
-def _render_thread(th, people, level, stats):
+def _render_thread(th, people, level, stats, doc_ids=None):
     """Turn a thread into {"title", "entries": [entry...], "emails", "dates", "idents",
     "org_idents"}. An entry is one email (plus its recovered quoted emails) and cannot
-    be split."""
+    be split. doc_ids: see build_digest."""
     entries = []
     dates = []
     seen_att = set()
@@ -1527,7 +1607,7 @@ def _render_thread(th, people, level, stats):
     for it in th["items"]:
         rec = it["rec"]
         text = it["text"]
-        atts, again, again_note = _attachments(rec, level, seen_att, it["text"])
+        atts, again, again_note = _attachments(rec, level, seen_att, it["text"], doc_ids)
         if it["ack"]:
             if level["ack"] == "drop" and not it["recovered"]:
                 if not atts:
@@ -1600,10 +1680,13 @@ _REVISION_HINT = re.compile(
     r"re-?issued?|superseded?|mark-?ups?|marked[- ]up|rev\.? ?[a-z0-9]{1,2})\b", re.I)
 
 
-def _attachments(rec, level, seen, text=""):
+def _attachments(rec, level, seen, text="", doc_ids=None):
     """Attachment names to list for one email, how many files were left out as
     "as above" (their names were already listed earlier in the thread), and the
     numbers of the camera photos among those ('IMG_9729,9730', else '').
+    doc_ids ({(record path, attachment index): "D12"}) adds ' =D12' to a file
+    whose contents are in the documents digest; a file whose name was listed
+    before but whose contents differ (another ID) is then listed again.
 
     Inline images are never listed. With "all" every file is listed every time.
     Otherwise a repeated name is listed again only when the email's text says the
@@ -1616,22 +1699,25 @@ def _attachments(rec, level, seen, text=""):
     names = []
     again = []
     again_low = set()
-    for att in rec.get("attachments") or []:
+    path = rec.get("path") or ""
+    for index, att in enumerate(rec.get("attachments") or []):
         if cleaning.is_inline_attachment(att):
             continue
         name = (att.get("name") if isinstance(att, dict) else str(att)) or ""
         name = cleaning.normalise_text(name).strip()
         if mode == "docs" and not cleaning.is_document(name):
             continue
-        low = name.lower()
+        doc_id = doc_ids.get((path, index)) if doc_ids else None
+        low = name.lower() + (" =" + doc_id if doc_id else "")
         if mode != "all" and low in seen and not revised:
             if low not in again_low:
                 again_low.add(low)
                 again.append(name)
             continue
         seen.add(low)
-        if name not in names:
-            names.append(name)
+        label = name + (" =" + doc_id if doc_id else "")
+        if label not in names:
+            names.append(label)
     note = ""
     if mode == "grouped":
         photos = [n for n in names if cleaning.is_camera_photo(n)]
@@ -1898,10 +1984,17 @@ _MARKERS = OrderedDict([
 ])
 
 
+# 'name =D12' inside [att: ...]: the file's contents are in the documents digest
+_DOC_ID_MARK = re.compile(r" =D\d+(?=[;\]])")
+
+
 def _body_markers(text):
     """The set of _MARKERS keys that appear in some digest text (a marker may be
-    one string or a tuple of alternatives)."""
-    return set(k for k, m in _MARKERS.items() if any(x in text for x in (m if isinstance(m, tuple) else (m,))))
+    one string or a tuple of alternatives), plus "docid" for a '=D12' mark."""
+    found = set(k for k, m in _MARKERS.items() if any(x in text for x in (m if isinstance(m, tuple) else (m,))))
+    if _DOC_ID_MARK.search(text):
+        found.add("docid")
+    return found
 
 
 def _count(n, word):
@@ -1919,7 +2012,7 @@ def _header_text(info, part_no, part_count, part_emails, part_threads, people, i
     if body is not None:
         markers = _body_markers(body)
     elif markers is None:
-        markers = set(_MARKERS)
+        markers = set(_MARKERS) | {"docid"}
     title = "SQUISH EMAIL DIGEST | " + info["name"]
     if part_count > 1:
         title += " | part %d of %d" % (part_no, part_count)
@@ -1955,6 +2048,8 @@ def _header_text(info, part_no, part_count, part_emails, part_threads, people, i
         extra.append("  recovered from inside a reply, forward or attachment because it was not filed on its own.")
     if "again" in markers:
         extra.append('  "N as above" in [att: ...] = N files whose names were listed earlier in the thread, sent again.')
+    if info.get("doc_ids") and "docid" in markers:
+        extra.append('  "name =D12" in [att: ...] = what the file says is in the documents digest under "## D12".')
     if "inline" in markers:
         extra.append('  "[inline replies: ...]" = answers the sender typed into the quoted email;'
                      ' re "first words\u2026": = the answer to the line that starts so.')

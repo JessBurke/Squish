@@ -7,6 +7,7 @@ test_end_to_end.py) runs the real readers and digest.
 
 import errno
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -18,10 +19,11 @@ import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from unittest import mock
 
-from squish_app import cli, engine, paths, projects
+from squish_app import cli, docdigest, docs, engine, paths, projects
 from tests import msg_builder as mb
 
 
@@ -127,8 +129,8 @@ class ScanAndReadTests(EngineTestBase):
         self.assertEqual(result["failed"], [])
         self.assertEqual(result["output_folder"], self.out)
         self.assertEqual(set(result), set(["cancelled", "files", "output_folder", "files_found",
-                                           "files_read", "from_cache", "failed", "stats",
-                                           "elapsed_s", "log_path", "finished_at"]))
+                                           "files_read", "from_cache", "failed", "doc_problems",
+                                           "stats", "elapsed_s", "log_path", "finished_at"]))
         self.assertEqual(self.outputs(), ["Squish - Test Project - 2025-02-14 to 2025-04-01.txt"])
         info = result["files"][0]
         self.assertEqual(info["path"], os.path.join(self.out, self.outputs()[0]))
@@ -206,10 +208,10 @@ class ScanAndReadTests(EngineTestBase):
         # Claude only sees the digest, so its header must say emails may be missing.
         real_read = engine.readers.read_email
 
-        def read(path):
+        def read(path, **kwargs):
             if os.path.basename(path) in ("top one.eml", "deep one.eml"):
                 raise ValueError("damaged")
-            return real_read(path)
+            return real_read(path, **kwargs)
 
         real_scandir = os.scandir
 
@@ -297,9 +299,9 @@ class CancelAndErrorTests(EngineTestBase):
         cancel = threading.Event()
         real_read = engine.readers.read_email
 
-        def slow_read(path):
+        def slow_read(path, **kwargs):
             time.sleep(0.6)
-            return real_read(path)
+            return real_read(path, **kwargs)
 
         timer = threading.Timer(0.1, cancel.set)
         with mock.patch.object(engine.readers, "read_email", side_effect=slow_read), \
@@ -426,11 +428,11 @@ class SafeOutputTests(EngineTestBase):
         real_read = engine.readers.read_email
         calls = []
 
-        def flaky(path):
+        def flaky(path, **kwargs):
             calls.append(path)
             if len(calls) > 5:
                 raise OSError(errno.EHOSTDOWN, "The network name cannot be found")
-            return real_read(path)
+            return real_read(path, **kwargs)
 
         with mock.patch.object(engine.readers, "read_email", side_effect=flaky):
             with self.assertRaises(engine.SquishError) as ctx:
@@ -1171,6 +1173,653 @@ class CliTests(EngineTestBase):
         self.assertEqual(code, 0)
         self.assertIn("damaged", err)
         self.assertIn("projects.json.bad-", err)
+
+
+
+# --------------------------------------------------------------------------
+# Documents (v1.1)
+# --------------------------------------------------------------------------
+
+GEOTECH = b"Allowable bearing pressure 150 kPa. Groundwater at 2.4 m."
+CALC = b"Pump duty 35 L/s at 18 m head"
+LOOSE_TIME = datetime(2025, 3, 11, 12, 0, tzinfo=timezone.utc).timestamp()
+
+
+def make_eml_with_files(subject, date_text, files, body="See attached."):
+    """Bytes of an .eml with file attachments [(name, bytes)]."""
+    msg = EmailMessage()
+    msg["From"] = "Sam Brown <sam.brown@riverside.example>"
+    msg["To"] = "alex@example.com"
+    msg["Subject"] = subject
+    msg["Date"] = date_text
+    msg["Message-ID"] = "<%s@riverside.example>" % subject.replace(" ", "-").replace(":", "")
+    msg.set_content(body)
+    for name, data in files:
+        msg.add_attachment(data, maintype="application", subtype="octet-stream", filename=name)
+    return msg.as_bytes()
+
+
+def fake_extract(name, data=None, path=None):
+    """Stands in for docs.extract, so these engine tests don't depend on how a
+    reader lays out a file: the bytes are the text ("BROKEN..." fails,
+    "DRAWING..." is a drawing). The real readers are used in test_end_to_end."""
+    doc = {"kind": "text", "status": "ok", "note": "", "title": "", "pages": None,
+           "drawing": False, "blocks": [], "chars": 0, "reader": "builtin"}
+    if not docs.is_supported(name):
+        doc.update(kind="other", status="unsupported", note="file type not read")
+        return doc
+    if data is None and path:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    if data is None:
+        doc.update(status="error", note="no file given")
+        return doc
+    text = data.decode("utf-8", "replace")
+    if text.startswith("BROKEN"):
+        doc.update(status="error", note="damaged file")
+        return doc
+    doc["blocks"] = [{"type": "para", "text": text, "level": 0}]
+    doc["chars"] = len(text)
+    doc["drawing"] = text.startswith("DRAWING")
+    return doc
+
+
+def focus_build_digest(records, project, source_label="", now=None, cancel=None, progress=None,
+                       doc_ids=None, **newer_options):
+    """Like fake_build_digest, but keeps only emails whose subject has a focus
+    keyword, and lists their documents as '[att: name =Dn]' like the real digest."""
+    words = [w.strip().lower() for w in (project.get("focus_keywords") or "").split(",") if w.strip()]
+    kept = [r for r in records if not words or any(w in r["subject"].lower() for w in words)]
+    result = fake_build_digest(kept, project, source_label)
+    # Like the real header, the "How to read" line has an example ID.
+    lines = ['How to read: "name =D3" in [att: ...] = in the documents digest', "## Fake thread"]
+    for r in kept:
+        marks = ["%s =%s" % (a["name"], doc_ids[(r["path"], i)])
+                 for i, a in enumerate(r["attachments"]) if doc_ids and (r["path"], i) in doc_ids]
+        lines.append("%s [att: %s]" % (r["subject"], "; ".join(marks)))
+    result["parts"][0]["text"] += "\n".join(lines) + "\n"
+    result["stats"]["emails_in"] = len(records)
+    return result
+
+
+class DocumentTestBase(EngineTestBase):
+
+    def setUp(self):
+        EngineTestBase.setUp(self)
+        patcher = mock.patch.object(engine.docs, "extract", side_effect=fake_extract)
+        self.extract = patcher.start()
+        self.addCleanup(patcher.stop)
+        # The real documents digest, watched so the tests can see what it was given.
+        patcher = mock.patch.object(engine, "build_documents_digest",
+                                    side_effect=docdigest.build_documents_digest)
+        self.doc_digest = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.docs_dir = os.path.join(self.tmp, "04 Reports")
+        self.report = self.add_bytes("reports/report.eml", make_eml_with_files(
+            "Geotech report", "Mon, 10 Mar 2025 12:00:00 +0000",
+            [("Geotech report.pdf", GEOTECH), ("IMG_0001.jpg", b"photo"),
+             ("Old spec.doc", b"old word")]))
+        self.resent = self.add_bytes("reports/resent.eml", make_eml_with_files(
+            "RE: Geotech report", "Wed, 12 Mar 2025 12:00:00 +0000",
+            [("Geotech report (1).pdf", GEOTECH), ("Calc.xlsx", CALC)]))
+        self.add_loose("Geotech copy.pdf", GEOTECH)
+        self.add_loose("Notes.txt", b"Site notes: gate code changed")
+        self.add_loose("Site plan.dwg", b"cad")
+        self.add_loose("sub/Deep.docx", b"Deep doc about piles")
+        self.add_loose("~$Calc.xlsx", b"office lock file")
+        self.add_loose(".hidden.pdf", b"hidden")
+        self.add_loose("filed.eml", make_eml("Filed in the reports folder").encode("utf-8"))
+        self.add_loose("Squish - Other - 2025-01-01 to 2025-01-02.txt", b"a digest")
+
+    def add_bytes(self, rel, data):
+        path = os.path.join(self.src, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        self.files[rel] = path
+        return path
+
+    def add_loose(self, rel, data):
+        """A file in the documents folder, modified 2025-03-11 (a loose file's date
+        counts in the documents digest's dates and file name)."""
+        path = os.path.join(self.docs_dir, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        os.utime(path, (LOOSE_TIME, LOOSE_TIME))
+        return path
+
+    def project(self, **changes):
+        p = EngineTestBase.project(self, docs_from_attachments=True, docs_folder=self.docs_dir,
+                                   docs_include_subfolders=True)
+        p.update(changes)
+        return p
+
+    def docs_passed(self):
+        """The documents list the last documents digest was given."""
+        return self.doc_digest.call_args[0][0]
+
+    def extracted(self):
+        """Names docs.extract was asked to read (with their bytes). The report is
+        attached twice under two names; whichever read thread gets to it first
+        reads it, so both names count as "Geotech report.pdf"."""
+        return sorted(c[0][0].replace(" (1)", "") for c in self.extract.call_args_list
+                      if c[1].get("data") is not None)
+
+    def text_of(self, kind):
+        paths_ = [f["path"] for f in self.last["files"] if f["kind"] == kind]
+        with open(paths_[0], encoding="utf-8") as fh:
+            return fh.read()
+
+    def run_it(self, **changes):
+        self.last = engine.run_project(self.project(**changes))
+        return self.last
+
+
+class DocumentRunTests(DocumentTestBase):
+
+    def test_attachments_and_loose_files_make_a_documents_digest(self):
+        result = self.run_it()
+        self.assertEqual(self.outputs(), [
+            "Squish - Test Project - 2025-02-14 to 2025-04-01.txt",
+            "Squish - Test Project - documents - 2025-03-10 to 2025-03-12.txt"])
+        self.assertEqual([f["kind"] for f in result["files"]], ["emails", "documents"])
+        self.assertEqual(result["files"][1]["documents"], 4)    # (the 2 other files are only listed)
+        # Each document once, numbered by first appearance: attachments by email
+        # date, then loose files by path. Unread ones (old .doc, .dwg) get no ID.
+        passed = self.docs_passed()
+        self.assertEqual([(d["id"], d["name"]) for d in passed], [
+            ("D1", "Geotech report.pdf"), ("", "Old spec.doc"), ("D2", "Calc.xlsx"),
+            ("D3", "Notes.txt"), ("", "Site plan.dwg"), ("D4", "Deep.docx")])
+        self.assertEqual(set(passed[0]), set(["id", "name", "sha1", "size", "doc", "sources"]))
+        self.assertEqual(passed[0]["size"], len(GEOTECH))
+        # The same report attached twice and saved in the folder: one document, three sources.
+        sources = passed[0]["sources"]
+        self.assertEqual([s["kind"] for s in sources], ["email", "email", "file"])
+        self.assertEqual([s["subject"] for s in sources[:2]], ["Geotech report", "RE: Geotech report"])
+        self.assertEqual(sources[1]["thread"], "Geotech report")
+        self.assertEqual(sources[0]["sender_name"], "Sam Brown")
+        self.assertEqual(sources[0]["sender_email"], "sam.brown@riverside.example")
+        self.assertEqual(sources[0]["path"], self.report)
+        self.assertEqual(sources[0]["sender_alias"], "")     # (the fake digest has no aliases)
+        self.assertEqual(sources[2]["path"], os.path.join(self.docs_dir, "Geotech copy.pdf"))
+        self.assertTrue(datetime.fromisoformat(sources[2]["mtime"]).tzinfo)
+        # Each distinct content is read once; skipped: the photo, '~$' and hidden
+        # files, emails and digests in the documents folder.
+        self.assertEqual(self.extracted(), ["Calc.xlsx", "Deep.docx", "Geotech report.pdf",
+                                            "Notes.txt"])
+        # The email digest marks the attachments with their IDs.
+        self.assertEqual(self.digest.call_args[1]["doc_ids"], {
+            (self.report, 0): "D1", (self.resent, 0): "D1", (self.resent, 1): "D2"})
+        self.assertEqual(self.doc_digest.call_args[1]["source_label"],
+                         "%s (attachments) + %s" % (self.src, self.docs_dir))
+        stats = result["stats"]
+        self.assertEqual([stats[k] for k in ("documents", "doc_drawings", "doc_other",
+                                             "doc_versions", "doc_failed")], [4, 0, 2, 0, 0])
+        self.assertEqual(result["doc_problems"], [])
+        with open(result["log_path"], encoding="utf-8") as fh:
+            log = fh.read()
+        self.assertIn("Documents: attachments yes | folder: %s" % self.docs_dir, log)
+        self.assertIn("Documents: 6 found (4 condensed this run", log)
+        self.assertIn("Documents that could not be read (0):", log)
+
+    def test_sources_use_the_email_digests_aliases(self):
+        def with_aliases(records, project, **kwargs):
+            result = fake_build_digest(records, project, **kwargs)
+            result["aliases"] = dict((r["path"], "RC.SB") for r in records)
+            return result
+
+        self.digest.side_effect = with_aliases
+        self.run_it()
+        self.assertEqual([s.get("sender_alias") for s in self.docs_passed()[0]["sources"]],
+                         ["RC.SB", "RC.SB", None])
+
+    def test_progress_has_a_documents_stage(self):
+        stages = []
+        engine.run_project(self.project(), progress=lambda st, d, t, m: stages.append(st))
+        order = [s for i, s in enumerate(stages) if i == 0 or stages[i - 1] != s]
+        self.assertEqual(order, ["scan", "read", "documents", "digest", "write"])
+
+    def test_without_documents_nothing_changes(self):
+        result = self.run_it(docs_from_attachments=False, docs_folder="")
+        self.assertEqual(self.outputs(), ["Squish - Test Project - 2025-02-14 to 2025-04-01.txt"])
+        self.assertNotIn("doc_ids", self.digest.call_args[1])
+        self.assertFalse(self.extract.called)
+        self.assertFalse(self.doc_digest.called)
+        self.assertFalse(os.path.exists(str(engine.docs_cache_path(self.project()))))
+        self.assertEqual(result["stats"]["documents"], 0)
+        for entry in self.cache_entries().values():
+            self.assertFalse(entry["docs"])
+            for att in entry["record"]["attachments"]:
+                self.assertNotIn("sha1", att)
+        with open(result["log_path"], encoding="utf-8") as fh:
+            self.assertNotIn("Documents", fh.read())
+
+    def test_documents_whose_contents_were_not_read_make_no_documents_digest(self):
+        self.add_bytes("reports/report.eml", make_eml_with_files(
+            "Geotech report", "Mon, 10 Mar 2025 12:00:00 +0000", [("Report.pdf", b"BROKEN pdf")]))
+        os.remove(self.resent)
+        result = self.run_it(docs_folder="")
+        self.assertEqual(self.outputs(), ["Squish - Test Project - 2025-02-14 to 2025-04-01.txt"])
+        self.assertFalse(self.doc_digest.called)
+        self.assertNotIn("doc_ids", self.digest.call_args[1])
+        self.assertEqual(result["doc_problems"], [["Report.pdf (attached to %s)" % self.report,
+                                                   "damaged file"]])
+
+    def test_attachments_only_or_folder_only(self):
+        self.run_it(docs_folder="")
+        self.assertEqual([d["name"] for d in self.docs_passed()],
+                         ["Geotech report.pdf", "Old spec.doc", "Calc.xlsx"])
+        self.assertEqual(self.doc_digest.call_args[1]["source_label"], "%s (attachments)" % self.src)
+        self.run_it(docs_from_attachments=False)
+        self.assertEqual([(d["id"], d["name"]) for d in self.docs_passed()],
+                         [("D1", "Geotech copy.pdf"), ("D2", "Notes.txt"), ("", "Site plan.dwg"),
+                          ("D3", "Deep.docx")])
+        self.assertNotIn("doc_ids", self.digest.call_args[1])
+        self.assertEqual(self.doc_digest.call_args[1]["source_label"], self.docs_dir)
+        # Without subfolders, the subfolder's file is left out.
+        self.run_it(docs_from_attachments=False, docs_include_subfolders=False)
+        self.assertNotIn("Deep.docx", [d["name"] for d in self.docs_passed()])
+
+    def test_ids_follow_email_dates_not_file_names(self):
+        self.add_bytes("a first.eml", make_eml_with_files(
+            "Later email", "Fri, 14 Mar 2025 12:00:00 +0000", [("Later.pdf", b"later")]))
+        self.add_bytes("z last.eml", make_eml_with_files(
+            "Early email", "Sat, 01 Mar 2025 12:00:00 +0000", [("Early.pdf", b"early")]))
+        self.add_bytes("undated.eml", make_eml_with_files(
+            "No date", "", [("Undated.pdf", b"undated")]).replace(b"Date: \n", b""))
+        self.run_it(docs_folder="")
+        self.assertEqual([d["name"] for d in self.docs_passed() if d["id"]],
+                         ["Early.pdf", "Geotech report.pdf", "Calc.xlsx", "Later.pdf", "Undated.pdf"])
+        self.assertEqual([d["id"] for d in self.docs_passed() if d["id"]],
+                         ["D1", "D2", "D3", "D4", "D5"])
+        # The same input gives the same IDs.
+        first = [(d["id"], d["sha1"]) for d in self.docs_passed()]
+        self.run_it(docs_folder="")
+        self.assertEqual([(d["id"], d["sha1"]) for d in self.docs_passed()], first)
+
+    def test_one_email_filed_twice_is_one_source(self):
+        with open(self.report, "rb") as fh:
+            self.add_bytes("copies/report copy.eml", fh.read())
+        self.run_it(docs_folder="")
+        geotech = self.docs_passed()[0]
+        self.assertEqual([s["subject"] for s in geotech["sources"]],
+                         ["Geotech report", "RE: Geotech report"])
+        self.assertEqual(self.digest.call_args[1]["doc_ids"][
+            (self.files["copies/report copy.eml"], 0)], "D1")
+
+    def test_big_attachments_and_unreadable_contents_are_other_files(self):
+        with mock.patch.object(docs, "DOC_MAX_BYTES", 40):
+            self.run_it(docs_folder="")
+        passed = dict((d["name"], d) for d in self.docs_passed())
+        self.assertEqual(passed["Geotech report.pdf"]["doc"]["status"], "too_big")
+        self.assertEqual(passed["Geotech report.pdf"]["id"], "")
+        self.assertEqual(passed["Calc.xlsx"]["id"], "D1")
+        # Not read, so the copy sent under another name can't be known to be the same.
+        self.assertEqual(passed["Geotech report (1).pdf"]["doc"]["status"], "too_big")
+        self.assertEqual(self.last["stats"]["doc_failed"], 2)
+        self.assertEqual(self.last["doc_problems"][0],
+                         ["Geotech report.pdf (attached to %s)" % self.report,
+                          "larger than 0 MB, not read"])
+
+    def test_date_filter_applies_to_attachments_not_loose_files(self):
+        result = self.run_it(date_from="2025-03-11")
+        passed = self.docs_passed()
+        self.assertEqual([(d["id"], d["name"]) for d in passed], [
+            ("D1", "Geotech report (1).pdf"), ("D2", "Calc.xlsx"), ("D3", "Notes.txt"),
+            ("", "Site plan.dwg"), ("D4", "Deep.docx")])
+        self.assertEqual([s["kind"] for s in passed[0]["sources"]], ["email", "file"])
+        names = [os.path.basename(f["path"]) for f in result["files"]]
+        self.assertEqual(names[1], "Squish - Test Project - documents - 2025-03-11 to 2025-03-12 "
+                                   "(only from 2025-03-11).txt")      # (the loose files' date counts)
+        # The documents used by emails outside the dates stay in the cache.
+        found, _files = engine.load_docs_cache(engine.docs_cache_path(self.project()))
+        self.assertEqual(len(found), 4)
+
+    def test_focus_keeps_matching_documents_and_those_shown_in_the_email_digest(self):
+        self.digest.side_effect = focus_build_digest
+        self.add_loose("Pile report.pdf", b"Pile capacity and geotechnical notes")
+        result = self.run_it(focus_keywords="geotech")
+        # Geotech report: name and text; Calc.xlsx: attached to a kept email (=D2
+        # in the email digest); Pile report: text ('geotechnical'). Notes, the
+        # deep doc and the unread files have no keyword.
+        self.assertEqual([d["name"] for d in self.docs_passed()],
+                         ["Geotech report.pdf", "Calc.xlsx", "Pile report.pdf"])
+        self.assertEqual([d["id"] for d in self.docs_passed()], ["D1", "D2", "D4"])
+        self.assertIn("=D2", self.text_of("emails"))
+        self.assertNotIn("Notes.txt", [d["name"] for d in self.docs_passed()])   # D3: the example
+        names = [os.path.basename(f["path"]) for f in result["files"]]
+        self.assertEqual(names[1], "Squish - Test Project - documents - 2025-03-10 to 2025-03-12 "
+                                   "(focus geotech).txt")
+        # Focus keywords match like the email digest's: accents, word starts.
+        self.run_it(focus_keywords="GROUNDWÄTER")
+        self.assertEqual([d["name"] for d in self.docs_passed()], ["Geotech report.pdf"])
+
+    def test_no_emails_left_still_writes_the_documents_digest(self):
+        self.digest.side_effect = focus_build_digest
+        result = self.run_it(focus_keywords="piles")
+        self.assertEqual([d["name"] for d in self.docs_passed()], ["Deep.docx"])
+        self.assertEqual([f["kind"] for f in result["files"]], ["documents"])
+        self.assertEqual(self.outputs(), ["Squish - Test Project - documents - 2025-03-11 to 2025-03-11 "
+                                          "(focus piles).txt"])
+
+
+class DocumentCacheTests(DocumentTestBase):
+
+    def test_second_run_extracts_nothing(self):
+        first = self.run_it()
+        before = self.snapshot()
+        self.extract.reset_mock()
+        again = self.run_it()
+        self.assertEqual((again["files_read"], again["from_cache"]), (0, first["files_read"]))
+        self.assertEqual(self.extracted(), [])
+        self.assertEqual(self.docs_passed()[0]["sources"][-1]["kind"], "file")
+        self.assertEqual(self.snapshot().keys(), before.keys())
+        with open(again["log_path"], encoding="utf-8") as fh:
+            self.assertIn("(0 condensed this run", fh.read())
+
+    def test_changed_loose_file_is_read_again_but_same_content_is_not_extracted(self):
+        self.run_it()
+        copy = os.path.join(self.docs_dir, "Geotech copy.pdf")
+        os.utime(copy, (1800000000, 1800000000))
+        notes = os.path.join(self.docs_dir, "Notes.txt")
+        with open(notes, "wb") as fh:
+            fh.write(b"Site notes: new gate code")
+        self.extract.reset_mock()
+        real_open = open
+        opened = []
+
+        def spy_open(path, *args, **kwargs):
+            opened.append(os.path.basename(str(path)))
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", spy_open):
+            self.run_it()
+        self.assertEqual(self.extracted(), ["Notes.txt"])
+        self.assertIn("Geotech copy.pdf", opened)       # re-hashed: its time changed
+        self.assertNotIn("Deep.docx", opened)           # unchanged: not opened at all
+        self.assertIn("new gate code", self.docs_passed()[3]["doc"]["blocks"][0]["text"])
+
+    def test_documents_switched_on_later_rereads_the_emails(self):
+        off = self.run_it(docs_from_attachments=False, docs_folder="")
+        self.assertEqual(off["files_read"], 6)
+        on = self.run_it()
+        self.assertEqual((on["files_read"], on["from_cache"]), (6, 0))
+        entries = self.cache_entries()
+        self.assertTrue(all(e["docs"] for e in entries.values()))
+        report = [e for p, e in entries.items() if p == self.report][0]["record"]
+        self.assertEqual(report["attachments"][0]["sha1"], hashlib.sha1(GEOTECH).hexdigest())
+        self.assertEqual(report["attachments"][0]["doc_size"], len(GEOTECH))
+        self.assertNotIn("sha1", report["attachments"][1])     # the photo
+        # Switching documents off again uses the cache as it is.
+        off = self.run_it(docs_from_attachments=False, docs_folder="")
+        self.assertEqual(off["files_read"], 0)
+
+    def test_attachment_bytes_are_never_cached(self):
+        self.run_it()
+        with gzip.open(str(engine.cache_path(self.project())), "rt", encoding="utf-8") as fh:
+            raw = fh.read()
+        self.assertNotIn("_data", raw)
+        self.assertNotIn("Allowable bearing", raw)      # the document's text lives in the docs cache
+        with gzip.open(str(engine.docs_cache_path(self.project())), "rt", encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["version"], engine.DOCS_CACHE_VERSION)
+        self.assertEqual(len(data["docs"]), 4)
+        self.assertEqual(sorted(os.path.basename(p) for p in data["files"]),
+                         ["Deep.docx", "Geotech copy.pdf", "Notes.txt"])
+        entry = data["docs"][hashlib.sha1(GEOTECH).hexdigest()]
+        self.assertEqual(entry["used"], datetime.now().date().isoformat())
+        self.assertEqual(entry["doc"]["blocks"][0]["text"], GEOTECH.decode())
+
+    def test_lost_documents_cache_rereads_only_emails_with_documents(self):
+        self.run_it()
+        os.remove(str(engine.docs_cache_path(self.project())))
+        self.extract.reset_mock()
+        again = self.run_it()
+        self.assertEqual(again["files_read"], 2)      # the two emails with documents
+        self.assertEqual(self.extracted(), ["Calc.xlsx", "Deep.docx", "Geotech report.pdf",
+                                            "Notes.txt"])
+
+    def test_corrupt_documents_cache_is_ignored(self):
+        self.run_it()
+        with open(str(engine.docs_cache_path(self.project())), "wb") as fh:
+            fh.write(b"not gzip")
+        again = self.run_it()
+        self.assertEqual(len(again["files"]), 2)
+        self.assertEqual(engine.load_docs_cache(engine.docs_cache_path(self.project()))[0].keys(),
+                         set(d["sha1"] for d in self.docs_passed() if d["sha1"]))
+
+    def test_unused_documents_are_dropped_after_30_days(self):
+        path = os.path.join(self.tmp, "docs.json.gz")
+        today = datetime(2026, 10, 6).date()
+        found = {"a": {"doc": {"status": "ok"}, "used": "2026-09-06"},
+                 "b": {"doc": {"status": "ok"}, "used": "2026-09-05"},
+                 "c": {"doc": {"status": "ok"}, "used": "2026-10-06"}}
+        files = {"/x/a.pdf": {"size": 1, "mtime": 1.0, "sha1": "a"},
+                 "/x/b.pdf": {"size": 1, "mtime": 1.0, "sha1": "b"}}
+        self.assertTrue(engine.save_docs_cache(path, found, files, today=today))
+        kept, kept_files = engine.load_docs_cache(path)
+        self.assertEqual(sorted(kept), ["a", "c"])
+        self.assertEqual(sorted(kept_files), ["/x/a.pdf"])
+        # A version from another Squish is ignored.
+        engine._save_json_gz(path, {"version": 999, "docs": found, "files": files})
+        self.assertEqual(engine.load_docs_cache(path), ({}, {}))
+
+    def test_cancel_while_documents_are_read_keeps_what_was_done(self):
+        cancel = threading.Event()
+
+        def extract_then_cancel(name, data=None, path=None):
+            if name == "Notes.txt":
+                cancel.set()
+            return fake_extract(name, data, path)
+
+        self.extract.side_effect = extract_then_cancel
+        with mock.patch.object(engine, "READ_WORKERS", 1):
+            result = engine.run_project(self.project(), cancel=cancel)
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(self.outputs(), [])
+        self.assertFalse(self.doc_digest.called)
+        found, _files = engine.load_docs_cache(engine.docs_cache_path(self.project()))
+        self.assertIn(hashlib.sha1(GEOTECH).hexdigest(), found)
+        self.assertIn(hashlib.sha1(CALC).hexdigest(), found)
+
+    def test_at_most_a_few_documents_are_condensed_at_once(self):
+        for i in range(12):
+            self.add_bytes("many/m%02d.eml" % i, make_eml_with_files(
+                "Many %02d" % i, "Thu, 06 Mar 2025 12:00:00 +0000",
+                [("Doc %02d.pdf" % i, b"doc %d" % i)]))
+        lock = threading.Lock()
+        busy = {"now": 0, "most": 0}
+
+        def slow_extract(name, data=None, path=None):
+            if data is None:       # only works out the kind of an unread file: instant
+                return fake_extract(name, data, path)
+            with lock:
+                busy["now"] += 1
+                busy["most"] = max(busy["most"], busy["now"])
+            time.sleep(0.02)
+            with lock:
+                busy["now"] -= 1
+            return fake_extract(name, data, path)
+
+        self.extract.side_effect = slow_extract
+        self.run_it()
+        self.assertEqual(busy["most"], engine.EXTRACT_AT_ONCE)
+        self.assertEqual(len([d for d in self.docs_passed() if d["id"]]), 16)
+
+
+class DocumentSafetyTests(DocumentTestBase):
+
+    def test_documents_never_stop_a_run(self):
+        def broken_extract(name, data=None, path=None):
+            if data is not None and name == "Calc.xlsx":
+                raise RuntimeError("bug in a reader")
+            return fake_extract(name, data, path)
+
+        self.extract.side_effect = broken_extract
+        result = self.run_it()
+        calc = [d for d in self.docs_passed() if d["name"] == "Calc.xlsx"][0]
+        self.assertEqual(calc["doc"]["status"], "error")
+        self.assertEqual(calc["id"], "")
+        self.assertEqual(result["stats"]["doc_failed"], 1)
+        self.assertIn(["Calc.xlsx (attached to %s)" % self.resent,
+                       "could not read this file (RuntimeError)"], result["doc_problems"])
+        with open(result["log_path"], encoding="utf-8") as fh:
+            log = fh.read()
+        self.assertIn("Documents that could not be read (1):\n  Calc.xlsx (attached to", log)
+
+    def test_failed_documents_digest_leaves_the_email_digest_without_marks(self):
+        self.doc_digest.side_effect = ValueError("docdigest bug")
+        result = self.run_it()
+        self.assertEqual(self.outputs(), ["Squish - Test Project - 2025-02-14 to 2025-04-01.txt"])
+        self.assertIn("doc_ids", self.digest.call_args_list[0][1])
+        self.assertNotIn("doc_ids", self.digest.call_args[1])     # built again without =Dn
+        self.assertEqual(result["stats"]["documents"], 0)
+        with open(result["log_path"], encoding="utf-8") as fh:
+            self.assertIn("The documents digest could not be made (ValueError: docdigest bug)",
+                          fh.read())
+
+    def test_missing_documents_folder_is_reported_not_fatal(self):
+        result = self.run_it(docs_folder=os.path.join(self.tmp, "gone"))
+        self.assertEqual(len(result["files"]), 2)      # emails, and the attachments' documents
+        self.assertEqual(len(result["doc_problems"]), 1)
+        folder, message = result["doc_problems"][0]
+        self.assertEqual(folder, os.path.join(self.tmp, "gone"))
+        self.assertTrue(engine.is_doc_folder_problem(message))
+        self.assertFalse(engine.is_folder_problem(message))
+        self.assertEqual(result["failed"], [])         # not an email problem
+
+    def test_output_folder_inside_the_documents_folder_is_skipped(self):
+        out = os.path.join(self.docs_dir, "Squish output")
+        self.add_loose("Squish output/leftover.pdf", b"not a project document")
+        engine.run_project(self.project(output_folder=out))
+        names = [d["name"] for d in self.docs_passed()]
+        self.assertNotIn("leftover.pdf", names)
+        self.assertIn("Notes.txt", names)
+        # The documents folder being the output folder: nothing is read from it.
+        result = engine.run_project(self.project(output_folder=self.docs_dir))
+        self.assertEqual(result["doc_problems"][0][0], self.docs_dir)
+        self.assertTrue(engine.is_doc_folder_problem(result["doc_problems"][0][1]))
+
+    def test_documents_folder_may_be_the_email_folder(self):
+        with open(os.path.join(self.src, "Loose report.pdf"), "wb") as fh:
+            fh.write(b"loose report text")
+        engine.run_project(self.project(docs_folder=self.src, docs_from_attachments=False))
+        self.assertEqual([d["name"] for d in self.docs_passed()], ["Loose report.pdf", "notes.txt"])
+
+    def test_scan_documents_skips_what_it_should(self):
+        found = engine.scan_documents(self.docs_dir)
+        self.assertEqual([os.path.relpath(p, self.docs_dir) for p, _m, _s in found],
+                         ["Geotech copy.pdf", "Notes.txt", "Site plan.dwg",
+                          os.path.join("sub", "Deep.docx")])
+        self.assertTrue(all(isinstance(m, float) and s > 0 for _p, m, s in found))
+        flat = engine.scan_documents(self.docs_dir, include_subfolders=False)
+        self.assertEqual(len(flat), 3)
+        skipped = engine.scan_documents(self.docs_dir, skip_folder=os.path.join(self.docs_dir, "sub"))
+        self.assertEqual(len(skipped), 3)
+        cancel = threading.Event()
+        cancel.set()
+        self.assertIsNone(engine.scan_documents(self.docs_dir, cancel=cancel))
+
+
+class DocumentOutputTests(DocumentTestBase):
+
+    def test_email_only_runs_never_delete_the_documents_digest(self):
+        self.run_it()
+        docs_file = "Squish - Test Project - documents - 2025-03-10 to 2025-03-12.txt"
+        self.assertIn(docs_file, self.outputs())
+        self.run_it(docs_from_attachments=False, docs_folder="")
+        self.assertEqual(self.outputs(), ["Squish - Test Project - 2025-02-14 to 2025-04-01.txt",
+                                          docs_file])
+        # A new email with a document: the documents digest is replaced, the
+        # email digest (same name) rewritten, nothing else left behind.
+        self.add_bytes("reports/later.eml", make_eml_with_files(
+            "Revised calc", "Thu, 20 Mar 2025 12:00:00 +0000", [("Calc rev B.xlsx", b"Rev B")]))
+        self.run_it()
+        self.assertEqual(self.outputs(), [
+            "Squish - Test Project - 2025-02-14 to 2025-04-01.txt",
+            "Squish - Test Project - documents - 2025-03-10 to 2025-03-20.txt"])
+
+    def test_documents_runs_never_delete_the_email_digest_of_another_kind(self):
+        self.run_it()
+        self.run_it(date_from="2025-03-11")
+        self.assertEqual(self.outputs(), [
+            "Squish - Test Project - 2025-02-14 to 2025-04-01.txt",
+            "Squish - Test Project - 2025-03-12 to 2025-04-01 (only from 2025-03-11).txt",
+            "Squish - Test Project - documents - 2025-03-10 to 2025-03-12.txt",
+            "Squish - Test Project - documents - 2025-03-11 to 2025-03-12 (only from 2025-03-11).txt"])
+        manifest = json.loads(Path(str(engine.manifest_path(self.project()))).read_text())
+        kinds = sorted(list(manifest["folders"].values())[0])
+        self.assertEqual(kinds, ["", "documents", "documents | from 2025-03-11 | to end | focus -",
+                                 "from 2025-03-11 | to end | focus -"])
+
+    def test_previous_files_stand_in_for_a_lost_record_per_kind(self):
+        first = self.run_it()
+        os.remove(str(engine.manifest_path(self.project())))
+        stale_docs = os.path.join(self.out, "Squish - Old Name - documents - "
+                                            "2025-01-01 to 2025-01-02.txt")
+        Path(stale_docs).write_text("old documents digest")
+        previous = [f["path"] for f in first["files"]] + [stale_docs]
+        self.run_it(previous_files=previous, docs_folder="")
+        self.assertNotIn(os.path.basename(stale_docs), self.outputs())
+        self.assertEqual(len(self.outputs()), 2)
+
+    def test_file_names_and_kinds(self):
+        parts = [{"first_date": "2025-01-02", "last_date": "2025-03-04"}]
+        self.assertEqual(engine.output_filenames("P", parts, kind="documents"),
+                         ["Squish - P - documents - 2025-01-02 to 2025-03-04.txt"])
+        self.assertEqual(engine.output_filenames("P", parts * 2, "focus pump",
+                                                 dates="only from 2025-01-01", kind="documents"),
+                         ["Squish - P - documents - 2025-01-02 to 2025-03-04 (only from 2025-01-01) "
+                          "(focus pump) (part %d of 2).txt" % n for n in (1, 2)])
+        name = "Squish - P - documents - undated (part 1 of 2).txt"
+        self.assertTrue(engine.is_old_output(name, "P", kind="documents"))
+        self.assertFalse(engine.is_old_output(name, "P"))
+        self.assertTrue(engine.is_digest_file_name(name))
+        self.assertEqual(engine.digest_file_kind(name), "documents")
+        self.assertEqual(engine.digest_file_kind("Squish - P - 2025-01-01 to 2025-01-02.txt"), "emails")
+        self.assertEqual(engine.digest_file_kind("Report.pdf"), "")
+        self.assertFalse(engine.is_old_output("Squish - P - 2025-01-01 to 2025-01-02.txt", "P",
+                                              kind="documents"))
+        self.assertEqual(engine.manifest_key("", "documents"), "documents")
+        self.assertEqual(engine.manifest_key("from x", "documents"), "documents | from x")
+        self.assertEqual(engine.manifest_key("from x"), "from x")
+
+
+class DocumentCliTests(DocumentTestBase):
+
+    def run_cli(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(list(args))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_docs_options(self):
+        code, out, err = self.run_cli("run", "--source", self.src, "--out", self.out,
+                                      "--name", "Cli Docs", "--docs-folder", '"%s"' % self.docs_dir)
+        self.assertEqual(code, 0, err)
+        project = self.digest.call_args[0][1]
+        self.assertEqual(project["docs_folder"], self.docs_dir)
+        self.assertIn("Wrote 2 file(s)", out)
+        self.assertIn("Squish - Cli Docs - documents - 2025-03-10 to 2025-03-12.txt", out)
+        self.assertIn("Documents: 4 documents, 2 other files", out)
+        code, out, err = self.run_cli("run", "--source", self.src, "--out", self.out,
+                                      "--name", "Cli Docs", "--no-docs")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(self.digest.call_args[0][1]["docs_from_attachments"])
+        self.assertNotIn("Documents:", out)
+        self.assertNotIn("doc_ids", self.digest.call_args[1])
+
+    def test_summary_lines_for_document_problems(self):
+        result = {"files": [], "output_folder": "/x", "doc_problems": [
+                      ["/x/04 Reports", "documents folder not found: check the VPN"],
+                      ["Report.pdf (attached to /x/a.msg)", "damaged file"]],
+                  "stats": {"emails_used": 1, "documents": 1, "doc_drawings": 2, "doc_other": 0,
+                            "doc_versions": 1, "doc_failed": 1}}
+        text = cli._format_summary({"name": "Job"}, result)
+        self.assertIn("Documents: 1 document, 2 drawings (1 later version shown as changes)", text)
+        self.assertIn("Documents folder /x/04 Reports: documents folder not found", text)
+        self.assertIn("1 document could not be read (see the run log)", text)
 
 
 if __name__ == "__main__":

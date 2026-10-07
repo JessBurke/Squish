@@ -26,7 +26,7 @@ squish/
   Squish.pyw              launcher: no args -> GUI; "--create-shortcuts" -> shortcuts; "run ..." -> CLI
                           (thin wrapper around squish_app/__main__.py; "python -m squish_app" is the same)
   Install Squish.bat      Windows installer: optional pip install, creates Desktop + Start Menu shortcuts
-  requirements.txt        extract-msg (optional)
+  requirements.txt        extract-msg, pypdf (both optional)
   README.md               user guide
   DESIGN.md               this file
   assets/                 squish.ico, squish.png (256), squish-64.png + squish-32.png (window
@@ -39,6 +39,9 @@ squish/
     msgfile.py            built-in OLE/CFB .msg reader (fallback, no dependencies)
     cleaning.py           body cleaning: quote splitting, signatures, disclaimers, noise
     digest.py             build_digest(records, project) -> DigestResult (pure, no I/O)
+    docdigest.py          build_documents_digest(docs, project) -> parts (pure, no I/O) (v1.1)
+    docs.py               extract(name, data|path) -> DocText ; Word/Excel/PowerPoint/PDF/text/zip (v1.1)
+    pdftext.py            built-in PDF text reader (no dependencies; used when pypdf is missing) (v1.1)
     engine.py             run_project(project, progress, cancel): scan, cache, read, filter, digest, write
     projects.py           load/save project list
     shortcut.py           Windows desktop / Start Menu shortcut creation
@@ -46,7 +49,9 @@ squish/
     cli.py                headless runner
   tests/                  unittest; run from squish/: python -m unittest discover -s tests -t .
                           (test_end_to_end.py: synthetic folder -> real readers + digest -> files;
-                          test_launcher.py: the message box used when tkinter is missing)
+                          test_launcher.py: the message box used when tkinter is missing;
+                          doc_builder.py: stdlib-only .docx/.xlsx/.pptx/.zip fixtures;
+                          pdf_builder.py: stdlib-only PDF writer for test fixtures)
 ```
 
 ## EmailRecord (readers.py -> everything else)
@@ -65,6 +70,7 @@ A plain JSON-serialisable dict (so it can be cached):
   "subject": str,
   "body": str,                 # plain text; from HTML (or RTF) if no plain body. Raw: NOT cleaned
   "attachments": [{"name": str, "size": int_or_None, "inline": bool,
+                   # (v1.1, documents read: "sha1", "doc_size" - see Documents)
                    "email": None or {      # an email attached to this one (not inline), one level deep:
                        "sender_name": str, "sender_email": str, "date": str,  # as the record's own fields
                        "to": [...], "cc": [...], "subject": str,
@@ -164,7 +170,9 @@ lock file never blocks (the OS lock dies with the process).
 saved project's run that wrote files without `--out`) is `projects.last_run_from_result(result)`:
 the RunResult without the `failed` list: `finished_at, elapsed_s, output_folder, log_path,
 files_found, files_read, from_cache, stats, files` plus `failed_count` (files and folders) and
-`failed_folders` (folders that couldn't be opened). The CLI saves it with
+`failed_folders` (folders that couldn't be opened), and (v1.1) `doc_problem_count` (the
+`doc_problems` entries) and `doc_problem_folders` (those that are folders,
+`engine.is_doc_folder_problem`). The CLI saves it with
 `projects.record_last_run(id, result) -> (saved, note)`, which takes the window lock (so nothing
 is saved while a Squish window is open: `note` says so) and never saves over a project list that
 couldn't be read. A run that writes no files leaves
@@ -465,7 +473,7 @@ Rules:
   ` (focus …)` and ` (part n of m)`, so another project called `<Project> - B` is never touched.
 
 `digest.build_digest(records, project, source_label="", now=None, outside_dates=0, cancel=None,
-progress=None, also_filed=None, no_access_emails=0, unreadable_files=0) -> dict`:
+progress=None, also_filed=None, no_access_emails=0, unreadable_files=0, doc_ids=None) -> dict`:
 
 ```python
 {
@@ -474,7 +482,8 @@ progress=None, also_filed=None, no_access_emails=0, unreadable_files=0) -> dict`
   "stats": {"emails_in": int, "emails_used": int, "duplicates": int, "noise_dropped": int,
             "acks_dropped": int, "filtered_out": int, "threads": int, "recovered_quoted": int,
             "raw_chars": int, "output_chars": int,
-            "acks": int}          # acknowledgement emails seen (shown as (ack), kept or dropped)
+            "acks": int},         # acknowledgement emails seen (shown as (ack), kept or dropped)
+  "aliases": {record path: "ORG.Initials"},   # see Email digest cross-references (v1.1)
 }
 ```
 
@@ -486,13 +495,15 @@ out because Squish has no access to their folder, and `unreadable_files` the num
 files the engine couldn't read (each for its own `Not included:` header line). `cancel` is a
 `threading.Event`; when it is set, `digest.DigestCancelled` is raised. `progress(done, total)` is
 called as the emails are cleaned and quoted emails recovered (Cancel is checked at the same
-points, every 50 emails, and also between threads while the parts are packed).
+points, every 50 emails, and also between threads while the parts are packed). `doc_ids`: see
+Documents (v1.1), Email digest cross-references.
 
 ## Engine (engine.py)
 
 `run_project(project, progress=None, cancel=None) -> RunResult`
 
-- `progress(stage, done, total, message)` — stage in `"scan" | "read" | "digest" | "write"`.
+- `progress(stage, done, total, message)` — stage in `"scan" | "read" | "documents" | "digest" |
+  "write"` (`"documents"` only when documents are on, see Documents (v1.1)).
   Called from the worker thread; the GUI marshals it to the UI thread.
 - `cancel` — a `threading.Event`; checked while files are read (at least every 0.5 s,
   `engine.CANCEL_CHECK_S`, so Cancel waits only for the files already being read), inside
@@ -521,7 +532,7 @@ points, every 50 emails, and also between threads while the parts are packed).
   network errors, which Windows also reports as PermissionError). File sizes and modified times
   come from the folder listing, so unchanged files need no extra call to the file server.
 - Cache: `paths.cache_dir()/<project id>.json.gz` maps source path -> `{mtime, size, record}`;
-  unchanged files are not re-read. `CACHE_VERSION` is 3; bump it when EmailRecord changes. The
+  unchanged files are not re-read. `CACHE_VERSION` is 4; bump it when EmailRecord changes. The
   cache is written as ASCII JSON (odd file names round-trip), via a temp file; temp files more
   than an hour old (from a save that never finished) are removed after a save. Entries for files
   that failed this time are kept; entries for files that are gone are dropped only after a
@@ -571,14 +582,18 @@ RunResult:
   "cancelled": bool,
   "files": [{"path": str, "chars": int, "bytes": int,
              "est_tokens": int,           # chars / engine.CHARS_PER_TOKEN (3.5)
-             "first_date": str, "last_date": str, "emails": int, "threads": int}],
+             "first_date": str, "last_date": str, "emails": int, "threads": int,
+             "kind": "emails" | "documents"}],   # (v1.1; a documents file also has "documents")
   "output_folder": str,
   "files_found": int, "files_read": int, "from_cache": int,
   "failed": [[path, error_message], ...],
+  "doc_problems": [[where, reason], ...],  # (v1.1) documents / documents folders not read
   "stats": {... digest stats ...,
             "outside_dates": int,         # emails dropped by the date filter
             "no_access_emails": int,      # emails in "no access" folders, left out
-            "unreadable_files": int},     # email files that couldn't be read (not folders)
+            "unreadable_files": int,      # email files that couldn't be read (not folders)
+            "documents": int, "doc_drawings": int, "doc_other": int,   # (v1.1, see
+            "doc_versions": int, "doc_failed": int},                    #  Documents)
   "elapsed_s": float,
   "log_path": str,
   "finished_at": "YYYY-MM-DD HH:MM",
@@ -610,6 +625,7 @@ python Squish.pyw run "Project name"                 # run a saved project
 python Squish.pyw run --source DIR [--out DIR] [--name NAME] [--squeeze standard]
                       [--part-size medium] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
                       [--keywords "a,b"] [--org "slrconsulting.com=SLR"] [--no-subfolders]
+                      [--no-docs] [--docs-folder DIR]
 python Squish.pyw list                               # list saved projects
 python Squish.pyw --create-shortcuts [--console]     # Desktop + Start Menu shortcuts (Windows);
                                                      # --console prints the result instead of a message box
@@ -632,7 +648,7 @@ with Ctrl+C.
 
 Left: project list (+ New, Duplicate, Delete). Right: the selected project's settings, a large
 **Squish!** button (Cancel while running), progress bar and status, and a results table of the
-output files (name, size, ~tokens, date range) with buttons **Show in folder** (Explorer with the
+output files (name, type, size, ~tokens, date range, contents) with buttons **Show in folder** (Explorer with the
 file selected — drag from there into Claude), **Copy file** (puts the file on the clipboard so it
 can be pasted into Claude with Ctrl+V; Windows via PowerShell `Set-Clipboard -LiteralPath`),
 **Copy text**, **Open folder**, and **View run log**. Settings auto-save; a failed save stays on
@@ -711,3 +727,413 @@ variables, never pasted into script text. The PowerShell way also writes the tas
 works, and the VBScript fallback can't set it. A Microsoft Store Python's `pythonw.exe` under
 `Program Files\WindowsApps` is replaced by its app alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`.
 Non-Windows: `(False, "Desktop shortcuts are only created on Windows")`.
+
+## Documents (v1.1): condensing Word, Excel, PowerPoint and PDF files
+
+Squish also condenses **documents**: files attached to the emails, and loose files in a
+documents folder. They go into a **separate digest** next to the email digest, so the email
+file stays small; the user drags in one or both. Everything above still applies; this section
+adds to it.
+
+### Settings (new Project keys, defaults filled by `projects.load_projects`)
+
+```python
+{
+  "docs_from_attachments": True,   # condense documents attached to the emails
+  "docs_folder": "",               # optional folder of loose documents ("" = none); may equal source_folder
+  "docs_include_subfolders": True,
+}
+```
+
+The squeeze level and file size apply to the documents digest too. Focus keywords keep a
+document when a keyword is in its name or text, or when it is attached to an email in a kept
+thread. The date range filters attachments by their email's date; loose files are not
+date-filtered (the header says so).
+
+### Supported types (`docs.py`, standard library only)
+
+| Type | How | Notes |
+|---|---|---|
+| .docx .docm .dotx | zipfile + XML | headings (`#`/`##`), paragraphs, list items (`•`), tables (`cell | cell` rows), text boxes, headers/footers once, tracked insertions kept and deletions dropped, comments as `[comment: …]`; footnotes appended |
+| .xlsx .xlsm | zipfile + XML | each visible sheet as compact rows `cell | cell` (cached values, never formulas; shared strings; inline strings; booleans; dates via the cell's number format -> `YYYY-MM-DD`; numbers without float noise); empty rows/columns skipped; hidden sheets listed by name only; rows beyond the level's cap noted `(+N more rows)` |
+| .pptx | zipfile + XML | `Slide N: title` then text and notes |
+| .pdf | `pypdf` when installed, else the built-in `pdftext.py` | page text; pages beyond the level's page cap noted; scanned PDFs (no text layer) -> status `no_text`; encrypted -> `protected` |
+| .txt .csv .md .rtf | direct (RTF via msgfile's RTF-to-text) | |
+| .zip | zipfile | member names listed (capped 60); documents inside (one level, total uncompressed ≤ 50 MB, ≤ 40 files) condensed like attachments |
+| .doc .xls .ppt (old binary formats), .dwg, images, anything else | not read | listed by name, size and where it came from in the "Other files" section |
+
+`docs.extract(name, data=None, path=None) -> DocText` (one of `data` bytes or `path`; never
+raises, never hangs: size cap `DOC_MAX_BYTES` 40 MB, page cap 300, zip-bomb guards, time is
+bounded by caps):
+
+```python
+{
+  "kind": "docx" | "xlsx" | "pptx" | "pdf" | "text" | "zip" | "other",
+  "status": "ok" | "no_text" | "protected" | "too_big" | "unsupported" | "error",
+  "note": str,                  # plain-English reason when status != ok, e.g. "PDF reader not available"
+  "title": str,                 # document title property, "" if none
+  "pages": int or None,         # PDF pages / slides / sheets
+  "drawing": bool,              # a PDF whose pages are A3 or larger, or named like a drawing (see below)
+  "blocks": [ {"type": "heading"|"para"|"item"|"row"|"sheet"|"page"|"slide"|"member", "text": str,
+               "level": int} ],     # structure kept so the renderer can cap smartly
+  "chars": int,                 # total text characters before any cap
+  "reader": "builtin" | "pypdf" | "pdftext",
+}
+```
+
+The extracted text is stored uncapped up to `DOC_TEXT_MAX` (400,000 characters); caps are
+applied when rendering. Reading stops once that much text is kept, so `chars` is then a lower
+bound. A document inside a zip keeps at most 50,000 characters.
+
+Blocks in detail (texts are tidied: single spaces, no control characters; only `para` and
+`item` texts may hold `\n`):
+
+- `heading`: `level` 1-9 (Word: Title and `heading N` styles or outline levels; PDF: numbered
+  `6.2 Title` lines - not dates such as `13 December 2024` or priced rows such as `1 Site
+  walkover $2,450.00` -, short ALL-CAPS lines and common report headings). The text includes Word's
+  list number when the heading is numbered (`"6.2 Allowable bearing pressure"`).
+- `item`: a list item; the text starts with its label (`"• "`, `"1. "`, `"a) "`), `level` is
+  the list depth (0 = top).
+- `row`: a table or sheet row, non-empty cells joined with `" | "` (sheets keep empty cells
+  between filled ones so columns line up: `"Total | | 4513426.78"`); `level` is the row's
+  index in its table or sheet, so `0` is the header row.
+- `sheet`: `text` = sheet name, `level` = sheet number; extra keys `"rows"` (all non-empty
+  rows in the sheet; at most 5,000 are kept as `row` blocks) and `"hidden": True` for a hidden
+  sheet (no rows follow). A .csv file is one `sheet` named after the file.
+- `page`: a PDF page mark, `text` "", `level` = page number; that page's heading/para/item
+  blocks follow. Wrapped lines are joined into paragraphs (a line ending in an amount such as
+  `$2,450.00` ends one: it is a priced table row); a page's first and last lines (its
+  header/footer) and contents-list lines stay separate blocks so the digest can drop them.
+- `slide`: `text` = slide title ("" if none), `level` = slide number; then the slide's other
+  text (`para`), tables (`row`) and `para` "Notes: …". Date/footer/slide-number placeholders
+  are skipped.
+- `member`: a zip member, `text` = its path in the zip, extra key `"size"` (bytes) and, for a
+  document read from the zip, `"doc"` (a nested DocText). A zip inside the zip is listed, not
+  opened. More than 60 other names -> one `para` `"(+N more files)"`.
+
+Word: a table of contents (`TOC N` styles or a Table of Contents content control) is skipped;
+footnote/endnote marks become `[1]`/`[e1]` with the notes as `para` blocks `"[1] …"` after the
+body, then one `"Header: … | …"` and one `"Footer: …"` para (each distinct line once;
+page-number-only lines dropped). `pages` is None for Word (the saved page count is often stale).
+Excel: dates `YYYY-MM-DD`, `YYYY-MM-DD HH:MM` when the format shows the time, times `HH:MM`;
+percent formats as shown (`35%`); numbers to at most 10 significant digits. PDF: under 20
+characters per page on average -> `no_text`; pypdf runs in a helper thread and is abandoned
+after 60 s (the pages read so far are used, with a note). A status of `ok` may still carry a
+note (`"partly read: …"`, `"stopped after 12 pages (slow to read)"`). An empty file is
+`no_text` ("empty file"). The content decides the reader when it disagrees with the extension
+(a PDF named .docx is read as a PDF; an old binary .doc named .docx is `unsupported`; a
+password-protected Office file is `protected`).
+
+Safety limits (per file): XML parts with a DTD or entity declarations, or declaring an unusual
+encoding, are refused; XML nesting ≤ 200; ≤ 1,500,000 XML elements and ≤ 150,000 Word
+paragraphs/tables; ≤ 64 MB parsed per XML part and ≤ 512 MB unzipped in all; a member that
+claims or reaches a compression ratio above 1100:1 is refused (zip bomb); ≤ 20,000 zip entries.
+A damaged or hostile auxiliary part (styles, comments, a slide) is skipped; a bad main part
+makes the status `error`. `docs.is_supported(name)`, `docs.looks_like_drawing_name(name)` and
+`docs.is_drawing(name, pages, page_sizes)` are public helpers. Set `SQUISH_NO_PYPDF=1` to always
+use the built-in PDF reader.
+
+`docs.backend_status()` -> e.g. `"PDF: pypdf 5.1.0"` or `"PDF: built-in reader (install pypdf for best results)"`.
+
+### Reading attachments
+
+When `docs_from_attachments` is on, the readers keep the **bytes** of attachments whose
+names have a supported extension (`docs.SUPPORTED_EXT`) and are ≤ `DOC_MAX_BYTES`, and the
+engine (not the reader) hands them to `docs.extract`. Each such attachment in the EmailRecord
+gets `"sha1": str` (of the bytes) and `"doc_size": int`; the bytes themselves are never cached
+or kept after extraction. The built-in .msg reader reads attachment data streams
+(`__substg1.0_37010102`) only for those attachments. Records read without documents have no
+`sha1`; when documents are switched on later, those emails are re-read (the cache entry
+records `"docs": True/False`). `CACHE_VERSION` is bumped (4).
+
+In detail: `readers.read_email(path, want_docs=False)`; with `want_docs` each such attachment
+also gets a transient `"_data": bytes` that the engine removes before caching
+(`readers.wants_doc_data(name, size)` is the test; inline attachments, attached emails and an
+S/MIME container never get bytes; attachments of an attached email are not read).
+`msgfile.read_msg(path, want_data=None)` / `read_msg_bytes(data, want_data=None)`:
+`want_data(name, data stream size)` is asked for each attachment of the filed email and a True
+answer puts the bytes in the attachment's `"data"` (a big .msg is still read in place: only
+those streams are read). extract-msg uses `attachment.data`; .eml uses the decoded payload.
+The engine condenses each email's documents in the read thread that read it, at most
+`engine.EXTRACT_AT_ONCE` (2) at a time, and drops the bytes, so attachment bytes are never all
+held at once. A cached email read with documents whose documents are no longer in the
+documents cache is read again.
+
+Extracted documents are cached by content in `paths.cache_dir()/<project id>.docs.json.gz`
+(`{"version": 1, "docs": {sha1: {"doc": DocText, "used": "YYYY-MM-DD"}}, "files": {path:
+{"size", "mtime", "sha1"}}}`, written atomically like the read cache; a damaged or
+other-version file is ignored; entries unused for 30 days are dropped on save, "used" meaning
+referred to by any of the project's emails or loose files, inside the dates or not). Loose
+files are cached by path + size + mtime -> sha1 in the same file. An identical file attached
+to many emails, or both attached and in the documents folder, is extracted and shown
+**once**. Files whose bytes are not read (too big, unsupported types) count as identical when
+name and size match.
+
+### Documents digest (`docdigest.py`, pure, no I/O)
+
+`docdigest.build_documents_digest(docs, project, source_label="", now=None) -> dict` with the same
+shape as `build_digest` (`parts`, `stats`). `docs` is a list of
+`{"id": "D12", "name", "sha1", "size", "doc": DocText, "sources": [...]}` where a source is either
+`{"kind": "email", "date", "sender_alias", "sender_name", "sender_email", "subject", "thread"}` or
+`{"kind": "file", "path", "mtime"}`. IDs are assigned by first appearance in time (attachments by
+email date, then loose files by path) and are stable for a given input. Documents that could not
+be read have `"id": ""`. The documents folder(s) are taken from `source_label`
+(`"<emails folder> (attachments) + <documents folder>"`).
+
+```
+SQUISH DOCUMENTS DIGEST | Riverside Depot | part 1 of 2
+Covers documents from 2024-08-22 to 2025-11-30 | 64 documents (12 attached to several emails, 3 later versions shown as changes), 9 drawings, 31 other files (this part: 30 documents, 2024-08-22 to 2025-03-30)
+Source: H:\Jobs\Riverside\01 Emails (attachments) + H:\Jobs\Riverside\04 Reports | squeeze: standard | made 2026-10-06 14:05
+How to read: "## D12 name (type)" starts a document. "From:" = where it came from: YY-MM-DD email SENDER
+  "subject" (+N more emails that also attached it), or the documents folder. The email digest marks the
+  same file [att: name =D12]. Long documents are condensed: headings ("# " lines), the opening and the
+  sentences/rows with figures, dates, references and requirements are kept in order; "…" = text left
+  out; "|" separates table cells; "•" = list item.
+  (+ one line each, only in parts that use them: "(+N more rows)", "Changes from D7:", "## D30 > name",
+  "## Drawings", "## Other files")
+People (ORG.Initials, as in the email digest):
+  RC = riverside.example: SB=Sam Brown
+
+## D12 Geotechnical Investigation Report Rev B.pdf (PDF, 38 pages) "Geotechnical Investigation"
+From: 25-03-04 email RC.SB "Geotech report" (+2 more emails); also documents folder\Superseded (modified 25-03-10)
+Riverside Depot Upgrade - Prepared for Riverside Council - Project 623.0001 - Rev B - 14 March 2025
+# 1 Executive summary
+The site is underlain by up to 1.2 m of fill over stiff clay. … Pad footings may be designed for an allowable bearing pressure of 150 kPa.
+# 2 Introduction …
+# 6 Foundations
+Groundwater was measured at 2.4 m below ground level in BH3. …
+(pages 61-80 not shown)
+
+## D15 Geotechnical Investigation Report Rev C.pdf (PDF, 39 pages)
+From: 25-04-10 email RC.SB "Geotech report Rev C"
+Changes from D12:
+# 6 Foundations
++ Pad footings may be designed for an allowable bearing pressure of 120 kPa.
+- Pad footings may be designed for an allowable bearing pressure of 150 kPa.
++ Groundwater inflows are expected in excavations deeper than 2 m.
+
+## D16 BoQ.xlsx (Excel, 2 sheets)
+From: 25-04-11 email RC.SB "Tender pricing"
+# Sheet BoQ (402 rows)
+Item | Description | Unit | Qty | Rate | Amount
+1.1 | Excavation zone 1 | m3 | 448 | 70.14 | 31422.72
+…
+| Total (excl. GST) | | | | 45885466.27
+(+280 more rows)
+
+## D30 Transmittal 14.zip (zip, 7 files)
+From: 25-05-02 email SLR.KP "Transmittal 14"
+Files: SI-14/Site instruction.docx (below), Locked.pdf (encrypted inside the zip), photos/ 5 photos IMG_0000,0001,0002,0003,0004
+## D30 > SI-14/Site instruction.docx (Word)
+# Site instruction 14
+Excavations deeper than 1.5 m require shoring. • Contractor to submit shoring design.
+
+## Drawings
+D20 623.0001-ST-1200 Layout [H].pdf (1 sheet, 25-02-20 email SLR.KP) - title: DEPOT SLAB SETOUT PLAN, for construction
+
+## Other files
+Site plan.dwg (2.1 MB; 25-02-20 email RC.SB; CAD drawing, not read)
+Old report.doc (340 KB; documents folder; old Word format (.doc), not read)
+```
+
+Rules:
+- **Caps per document** by squeeze level (`docdigest.DOC_CAPS`: text characters; spreadsheets also
+  rows per sheet; PDFs also pages): light 30,000 / 400 rows / 200 pages; standard 8,000 / 120 rows /
+  60 pages; max 2,500 / 30 rows / 15 pages (pages after the cap: `(pages 61-80 not shown)`).
+  The text is cut into sentences and rows (`cleaning.fact_pieces`, the way `cleaning.cap_text`
+  sees text: a long sentence with facts is split at its clauses) and kept in this order while it
+  fits: sheet names, header rows and total rows of sheets; headings, top level first, up to 20% of
+  the cap; the opening, in order, up to 25%; then the pieces with the most facts
+  (`docdigest.doc_fact_score` = `cleaning.fact_score` plus dates with a year, standards
+  (`AS 3600`), structural designations (`360UB56.7`, `200PFC`, `150x150x9.0 SHS`, `N16-200`,
+  `SL92`, `M24`, `8.8/S`, `300PLUS`), ratios (`span/250`, `1V:1H`), clause references,
+  shall/must/minimum, risks/recommendations/conclusions, design values; a piece with a figure,
+  date or reference comes first; text under summary / conclusion / recommendation headings (and
+  their sub-headings) counts more and text in appendices less; a table row in a report counts at
+  most as much as a good sentence; text that repeats one pattern with only its figures changed -
+  more than `docdigest.REPEAT_SHAPES` (6) pieces with the same words, such as pages of member
+  checks or inspection records - counts for less, × sqrt(6 / how many), so it does not crowd
+  out the sentences around it); then whatever follows the opening, in order. A sentence
+  repeated word for word is kept once.
+  Output: `# ` heading lines (slides `# Slide 3: title`, sheets `# Sheet name (N rows)`), a line
+  per paragraph with list items joined by ` • `, table rows on their own lines, `…` where text
+  was left out (at the end of the line before the gap, or on its own line between rows). A
+  spreadsheet keeps its header row(s), its total rows and the most informative rows, in order,
+  then `(+N more rows)`: rows whose cells are unusual for their column count most (an `Open`
+  among many `Closed`, a written-out answer among `As per drawing`s), then rows with more
+  figures; when a workbook has several sheets each first gets an equal share. Word's `Header: …` /
+  `Footer: …` lines are kept, without page numbers and labels such as "Commercial in confidence".
+  A DocText note is shown as `Note: …` under the `From:` line.
+- **Boilerplate** removed before capping: PDF page headers/footers (the first/last lines of a
+  page) repeated on 30%+ of pages (digits ignored), page numbers ("Page 3 of 12"), tables of
+  contents (dot leaders; a Contents heading and the lines after it ending in page numbers; 3+
+  numbered lines with rising page numbers near the start), cover-page, copyright,
+  limitation-of-liability and contact wording (`©`, `(c) Example Consulting Pty Ltd`, "all
+  rights reserved", "sole use", "shall only be used for the purposes", "no
+  liability", "third party", "professional judgement", "results relate only to", "confers no
+  rights", ABN / www / phone lines …; when such a paragraph stops mid-sentence, a short
+  lower-case line straight after it is its end and goes too), every sentence without a figure
+  under a `Limitations` /
+  `Disclaimer` / `Copyright` / `Important information` heading, repeated identical
+  paragraphs (30+ characters), empty table cells (Word/PDF tables; sheets keep empty cells between
+  filled ones). PDF lines split by a page break or a ragged wrap are joined again (a long line
+  that does not end a sentence, or with an amount such as `$2,450.00`, runs on), runs of short
+  table-cell lines are gathered into one
+  paragraph, and a number split at a line end (`623.0001-ST- 1200`) is put back together.
+- **Versions**: documents with the same normalised name (`docdigest.family_key`: case, spaces,
+  extension, revision markers such as `Rev B`, `_v2`, `[C]`, `(1)`, dates and words like draft /
+  final / issued ignored) form a family, put oldest first: by the revision in their names when
+  every one has one (`P1`, `P2`, then letters `A`, `B` …, then numbers `0`, `1` …, `v2`), else
+  by date (a date in the name, else the day first sent or saved), then by ID - so an old revision
+  kept in a `Superseded` folder (numbered after the new one that came by email) is still the
+  older one, and the newer one shows `Changes from` it. Versions are compared sentence by sentence
+  (headings and rows as they are, punctuation, bullets and line wrapping ignored), over the whole
+  text, with difflib. A later version is compared with the latest earlier one in the same format
+  (Word with Word, PDF with PDF, else the latest), and when ≥ 60% similar shows only `Changes
+  from Dn:`: the heading of each changed section (`# …`), `+ …` new or changed text and `- …`
+  removed text (cut to 120 characters, at most 40 / 20 / 8 removed passages for light / standard
+  / max), capped like a document; in a passage that is mostly the same only the changed
+  sentence is shown (`+ Pad footings may be designed for an allowable bearing pressure of 120
+  kPa.`; in a sentence over 300 characters the changed words with six words either side), and a
+  changed row is shown whole (`+` new row, `-` old row). Text that is only cut up differently
+  counts as the same: `Changes from D12: none (the text is the same).` A file with the same name
+  as an earlier one in another format (`Report Rev B.docx` and `Report Rev B.pdf`) and ≥ 75%
+  similar is one document: `The same document as D12 in another format (90% of the text reads the
+  same; differences in layout and tables are not shown).` (`Same text as D12 (in another
+  format).` when identical). A document with exactly the same text as an earlier one, under any
+  name, shows `Same text as D12.` A version that is too different is shown in full.
+- **Drawings**: a PDF with most pages A3 or larger, or a name matching drawing-number patterns
+  (e.g. `-ST-`, `-CI-`, `-C-`, `DWG`, `-SK`, sheet/rev markers) and ≤ 5 pages, goes to the
+  `## Drawings` index: one line with the ID, name, sheet count, source and, when found in the
+  title block text, title (unless the name already has it), revision (unless the name already
+  has it: the file name's `[H]` / `Rev H` wins) and status such as "for construction" (light
+  also keeps up to 600 characters of notes after `| notes:`, leaving out grid labels and
+  dimension strings: 6+ tokens of which under a fifth are words). Drawings inside a zip are listed
+  as `D30 > name (1 sheet) - …` (the `D30 >` says where they are).
+- **Zip files** are documents: a `Files:` line (camera photos grouped as in the email digest,
+  `(below)` for documents shown under it, the reason for documents that could not be read, at
+  most 12 names per folder; a folder that holds the whole zip is named once, `Files (in IFC
+  2025-02-14/): …`, and left out of the names below; a folder with several entries is named
+  once, `folder/: a, b` with `; ` between folders; two or more drawings in a folder are counted,
+  `16 drawings (see Drawings)`), then each document inside as `## D30 > path (type)` with its own
+  cap of max(15% of the cap, min(the cap, 2 × cap ÷ number of documents)).
+- **Other files** (unsupported, protected, no text, too big, errors) go into one `## Other files`
+  section, one line each: `name (size; source; reason)`.
+- **Sources**: `From:` shows the first email (`YY-MM-DD email ALIAS "thread"`, the subject cut
+  to 70 characters) with `(+N more emails)`, then the first file (`documents folder\sub`, or the
+  file's own folder when it is not under a documents folder, with `(modified YY-MM-DD)`) with
+  `(+N more copies)`. No sources -> no `From:` line. A document title property that adds to the
+  file name is shown after the type in quotes.
+- **Header**: `Covers documents from <first> to <last>` (source dates: email dates and file
+  modified dates) and the counts; `part n of m` and `(this part: …)` only when there is more than
+  one part; `Focus keywords: …` and a `Dates: only documents attached to emails dated …; files in
+  the documents folder are included whatever their date` line when the project has them (the
+  engine has already applied them). The legend lists only the aliases shown on that part's
+  `From:` and drawing lines, with names and domains from the sources; a source without a
+  `sender_alias` gets one worked out like the email digest's (`digest.People`).
+- **Splitting**: a document is never split across parts unless it alone exceeds the part size;
+  it then continues under `## D12 name (continued)` (a line too long for a part is cut after a
+  sentence). The Drawings and Other files lists continue under `## Drawings (continued)` /
+  `## Other files (continued)`. Each part: `{"text", "first_date", "last_date", "documents"
+  (documents + drawings in it), "other_files", "emails": 0, "threads": 0}`.
+- **Stats**: `documents`, `doc_drawings`, `doc_other`, `doc_versions` (documents shown as changes,
+  as the same text, or as another format of an earlier one), `doc_failed` (other files with status error / too_big / protected /
+  no_text), `doc_multi_email`, `raw_chars` (all documents' `chars`), `output_chars`.
+- No document and no drawing with readable contents -> no parts (other files alone are not worth a
+  digest). Deterministic for a given `now` (any `PYTHONHASHSEED`).
+
+### Email digest cross-references
+
+`build_digest(..., doc_ids=None)`: `doc_ids` maps `(record path, attachment index)` -> `"D12"`.
+When given, an attachment whose contents are in the documents digest is written as
+`name =D12` inside `[att: …]` (a name already listed in the thread is listed again when its
+contents are a different document, i.e. another ID), and the "How to read" of each part that
+has such a mark gains the line `"name =D12" in [att: ...] = what the file says is in the
+documents digest under "## D12".` Without `doc_ids` (None or empty) the email digest is unchanged.
+
+The result of `build_digest` also has `"aliases"`: `{record path: sender alias}` exactly as the
+email digest shows each sender (a copy dropped as a duplicate gets the alias of the copy shown; a
+sender the digest does not show, e.g. left out by the focus keywords, gets an alias no shown
+person has; `?` when nothing is known). `digest.alias_for_records(records, project,
+also_filed=None)` returns the same mapping without rendering (a second pass over the emails, so
+the engine uses the result's `"aliases"`).
+
+### Engine
+
+- New progress stage `"documents"` between `"read"` and `"digest"` (extracting, with
+  `done/total` and cancel checks between documents). Loose files are scanned in the scan stage.
+  Attachments are condensed during the read stage (see Reading attachments); the documents
+  stage condenses the loose files (a small thread pool) and puts the documents in order.
+- Documents folder scan (`engine.scan_documents`): recursive per `docs_include_subfolders`;
+  skips email files (read as emails), Squish digest files, `~$` files, hidden and system files
+  and folders, and the output folder with everything in it. A documents folder that is missing,
+  is the output folder, or has folders that can't be opened never stops a run: each problem is
+  a `doc_problems` entry (`engine.is_doc_folder_problem(message)` tells folders from documents).
+- Which documents: attachments with a supported extension, plus attachments that are other
+  document types worth listing (`engine.OTHER_DOC_EXT`: old Office formats, CAD, ...; images and
+  other files are only listed in the email digest); every file in the documents folder.
+- IDs `D1`, `D2` … go only to documents whose contents were read (status `ok`), by first
+  appearance (attachments by their email's date, undated last, then loose files by path).
+  Other files have `"id": ""`. A documents digest is made only when at least one document was
+  read; `doc_ids` is passed to `build_digest` only when there are IDs (so without documents
+  the email digest is unchanged). If the documents digest can't be made (an error, noted in the
+  run log) the email digest is built again without `doc_ids`, so it never points at a missing
+  file.
+- The `docs` list given to `build_documents_digest` has, per document, also `"size"` (bytes),
+  and email sources also have `"sender_name"`, `"sender_email"` and `"path"`; `"thread"` is the
+  cleaned subject and `"sender_alias"` comes from the email digest's result `"aliases"`
+  (`{record path: alias}`, the same as `digest.alias_for_records`), else `""` (docdigest then
+  aliases the senders from their names). One email filed in several folders is one source. A
+  file source's
+  `"mtime"` is local ISO 8601 with offset, like EmailRecord dates.
+- Dates and focus keywords are applied by the engine, before `build_documents_digest`
+  (docdigest must not filter again; it only says so in its header): attachments go with their
+  email's date (loose files are not dated); with focus keywords a document is kept when a
+  keyword (matched as in the email digest) is in its name or text, or when its `=Dn` appears
+  in the email digest (it is attached to an email in a kept thread). A run whose filters leave
+  no emails can still write a documents digest.
+- Output file names: `Squish - <Project> - documents - <dates>.txt` (plus the usual
+  `(part N of M)`, `(only …)`, `(focus …)`); written and replaced with the same all-or-nothing
+  swap (one swap for both digests) and `.outputs.json` bookkeeping as the email digest (its own
+  kind: key `"documents"` or `"documents | <filter_key>"`, so an email-only run never deletes a
+  documents digest and vice versa; `engine.digest_file_kind(filename)`).
+- RunResult `files[i]` gains `"kind": "emails" | "documents"` (a documents file also has
+  `"documents"`, the part's document count); `stats` gains `documents`, `doc_drawings`,
+  `doc_other`, `doc_versions`, `doc_failed` (docdigest's own numbers under those names win,
+  else the engine counts; all 0 when no documents digest was written); RunResult gains
+  `"doc_problems": [[where, reason], ...]` (documents whose contents couldn't be read - error,
+  too big, protected, no text - as `"<name> (attached to <email path>)"` or the file's path,
+  and documents folder problems). A document that fails to extract never stops a run (it is
+  listed under Other files with its reason, and in the run log's "Documents that could not be
+  read" section).
+- No documents found -> no documents digest (not an error).
+
+### CLI and GUI
+
+- CLI: `--no-docs` (skip attachments), `--docs-folder DIR` (also with a saved project, for that
+  run only). The summary adds `Documents: 64 documents, 9 drawings, 31 other files` (+ `(N later
+  versions shown as changes)`), documents folder problems and `N documents could not be read (see
+  the run log)`.
+- GUI: a **Documents** tab (second, after Emails): "Condense Word, Excel, PowerPoint and PDF
+  attachments" checkbox, a "Documents folder" (entry + Browse + Include subfolders, with a
+  background file count like the emails folder: `gui.count_document_files` uses
+  `engine.scan_documents`, skipping the output folder, and counts documents Squish condenses
+  (`docs.is_supported`) apart from other files, which are only listed: "64 documents found
+  (incl. subfolders) - plus 31 other files, listed by name only."; a folder that is missing or
+  is the output folder gets an amber warning, never an error, as it never stops a run), and a
+  "PDF reader" line from `docs.backend_status()` ("checking..." until known; the pypdf version,
+  or plain advice when pypdf is missing: "PDFs are read with Squish's built-in reader. For
+  better results, run Install Squish.bat again or ask IT to install the pypdf package."). The
+  count and the PDF line also show in the compact layout. The results table gets a **Type**
+  column (Emails / Documents), and its last column is **Contains** ("1,876 emails" /
+  "64 documents"); the File column takes the room the others leave. The summary calls the
+  email digest "1 emails file, ~60k tokens" when there is a documents file too, and adds "73
+  documents condensed (incl. 9 drawings) into 1 documents file, ~43k tokens, plus 31 other
+  files listed." (drawings count as documents, as in a part's `documents`) and the documents
+  that couldn't be read; the Done message is amber when the documents folder couldn't be read. The documents
+  stage shows "Condensing documents 12 of 64...". With both kinds of file, the tip and the Done
+  message say: drag in the emails file first; add the documents file when you need what the
+  attachments say (or, when together they are too big for one chat, a new chat for each file,
+  starting with the emails file).
+- `Install Squish.bat` also tries `pip install --user --upgrade pypdf`; `requirements.txt`
+  lists it as optional.
