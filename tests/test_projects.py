@@ -436,9 +436,27 @@ class LastRunTests(ProjectsTestCase):
         saved = projects.last_run_from_result(result)
         self.assertEqual((saved["doc_problem_count"], saved["doc_problem_folders"]), (3, 1))
         self.assertNotIn("doc_problems", saved)
+        self.assertFalse(saved["doc_folder_is_output"])
         # A run without documents (or from an engine without them) counts none.
         saved = projects.last_run_from_result(self.RESULT)
         self.assertEqual((saved["doc_problem_count"], saved["doc_problem_folders"]), (0, 0))
+        self.assertFalse(saved["doc_folder_is_output"])
+        self.assertFalse(saved["doc_digest_failed"])
+
+    def test_last_run_keeps_why_the_documents_are_missing(self):
+        # The documents folder was the output folder (skipped, not "couldn't be
+        # opened"), and the documents digest couldn't be made.
+        result = dict(self.RESULT, doc_digest_failed=True, doc_problems=[
+            ["/out", "documents folder not read: it is the output folder"]])
+        saved = projects.last_run_from_result(result)
+        self.assertTrue(saved["doc_folder_is_output"])
+        self.assertTrue(saved["doc_digest_failed"])
+        self.assertEqual((saved["doc_problem_count"], saved["doc_problem_folders"]), (1, 1))
+        self.assertTrue(projects.is_docs_folder_output_problem(
+            "documents folder not read: it is the output folder"))
+        self.assertFalse(projects.is_docs_folder_output_problem(
+            "documents folder not found: check the VPN"))
+        self.assertFalse(projects.is_docs_folder_output_problem(None))
 
     def test_record_last_run_saves_it(self):
         a, b = projects.new_project("A"), projects.new_project("B")

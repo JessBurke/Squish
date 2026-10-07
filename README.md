@@ -1,10 +1,10 @@
 # Squish
 
-**Squash a folder of emails into one file you can drop into Claude.**
+**Squash a project's emails and documents into small files you can drop into Claude.**
 
 Your filed project emails (the `.msg` files Mail Manager saves into the project
 folders) are far too big and messy to give to Claude as they are. Squish reads a
-whole folder of them - or a folder of folders - and writes one compact text file:
+whole folder of them - or a folder of folders - and writes a compact text digest:
 every conversation in date order, who wrote to whom and when, and only the *new*
 text of each email. Quoted replies, signatures, disclaimers, logos and duplicate
 copies are cut out. A project's worth of email usually shrinks to a small fraction
@@ -16,7 +16,8 @@ for each file** (Squish tells you when they are small enough to share one chat).
 
 Squish also condenses the **Word, Excel, PowerPoint and PDF documents** attached
 to the emails (and, if you like, a folder of reports) into a second, separate file -
-see [Documents](#documents).
+see [Documents](#documents). (Documents came in Squish 1.1; the version shows at the
+bottom right of the Squish window and in *Help > About*.)
 
 You can set up as many projects as you like; Squish remembers each one.
 
@@ -74,7 +75,8 @@ Python itself.
    first run of a big folder on a network drive can take a few minutes; after
    that Squish remembers what it has read, so re-runs are much quicker. (The
    first run after updating from Squish 1.0 reads every email again, because it
-   now reads the attached documents too.)
+   now reads the attached documents too. After updating from Squish 1.0, run
+   `Install Squish.bat` again to add the PDF reader.)
 4. **Give the file to Claude**, either way:
    - click **Show in folder** and drag the file into the Claude window, or
    - click **Copy file**, click in Claude's message box and press **Ctrl+V**.
@@ -116,15 +118,19 @@ Long documents keep their headings and the sentences and table rows with figures
 dates and requirements; a later revision of a report shows only what changed
 from the earlier one. Drawings get one line each (title and revision). In the
 email file, an attachment that is in the documents file is marked with its
-number, e.g. `[att: Geotech report.pdf =D12]`, so Claude can match them up.
+number, e.g. `[att: Geotech report.pdf =D12]`, so Claude can match them up -
+**but only when both files are in the same Claude chat**. If they are too big to
+share one chat, narrow the run with *From* / *To* dates or *Focus keywords* to get
+a pair that fits (or, if you chose File size *Small*, try a larger size).
 
-**Not read** (listed by name only, so Claude knows they exist): old `.doc`,
+**Not read** (only listed, so Claude knows they exist): old `.doc`,
 `.xls` and `.ppt` files (save them as `.docx`, `.xlsx` or `.pptx` if you need
 them), scanned PDFs that have no text in them, CAD files, and anything on a
-drawing beyond its title block.
+drawing beyond its title block (Squeeze *Light* also keeps a few lines of a
+drawing's notes).
 
 **Drag in the emails file first; add the documents file when you need what the
-attachments say.** Then try:
+documents say.** Then try:
 
 - *"Using the emails and documents digests, list every requirement in the
   geotech report and whether the emails show it was addressed."*
@@ -222,9 +228,9 @@ read.
 
 **Some documents couldn't be read.** Usually these are scanned PDFs (pictures of
 pages, with no text in them) or password-protected files. They are listed by
-name in the documents file; **View run log** gives the reason for each. Some
-PDFs are only locked against editing; Squish can read the older kind of those
-when the optional pypdf helper is installed (run `Install Squish.bat` again).
+name in the documents file; **View run log** gives the reason for each. PDFs
+that are only locked against editing or copying are read normally; PDFs that
+need a password just to open them can't be read.
 
 **Very long folder paths** (over 260 characters) are handled - Squish uses
 Windows' long-path support when reading.

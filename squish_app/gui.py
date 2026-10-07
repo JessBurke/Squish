@@ -56,7 +56,7 @@ COLOURS = {
     "good": "#1E7B34",
 }
 
-TAGLINE = "Squash a folder of emails into one file you can drop into Claude"
+TAGLINE = "Squash a project's emails and documents into small files you can drop into Claude"
 PASTE_KEY = "Cmd+V" if IS_MAC else "Ctrl+V"
 TIP = ("Click Show in folder, then drag the file into Claude - or click Copy file, then press %s "
        "in Claude." % PASTE_KEY)
@@ -79,8 +79,12 @@ PDF_ADVICE = ("PDFs are read with Squish's built-in reader. For better results, 
 DEFAULT_NAME_RE = re.compile(r"^%s( \d+)?$" % re.escape(projects.DEFAULT_NAME), re.I)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # The ' (only <dates>)' tag a dated run adds to its file names (see engine.output_filenames)
-DATES_TAG = (r" \(only (?:\d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}|from \d{4}-\d{2}-\d{2}"
-             r"|up to \d{4}-\d{2}-\d{2})\)")
+DAY = r"\d{4}-\d{2}-\d{2}"
+DATES_TAG = r" \(only (?:%s to %s|from %s|up to %s)\)" % (DAY, DAY, DAY, DAY)
+# The same tag at the end of a file name, with its dates as groups: (from, to) or from or to
+ONLY_DATES_RE = re.compile(r" \(only (?:(%s) to (%s)|from (%s)|up to (%s))\)"
+                           r"(?: \(focus[^()]*\))?(?: \(part \d+ of \d+\))?\.txt$"
+                           % (DAY, DAY, DAY, DAY), re.I)
 OUTPUT_NAME_RE = re.compile(  # see engine.output_filenames ('documents - ' is kept)
     r"^Squish - .+? - (?=(documents - )?(\d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}|undated)"
     r"(%s)?( \(focus[^()]*\))?( \(part \d+ of \d+\))?\.txt$)" % DATES_TAG, re.I)
@@ -121,19 +125,24 @@ Documents (Word, Excel, PowerPoint and PDF files)
    figures, dates and requirements; a later version of a document shows
    only what changed. Drawings are listed with their title and revision.
    Drag in the emails file first; add the documents file when you need
-   what the attachments say, e.g.:
+   what the documents say, e.g.:
      "Using the emails and documents digests, list every requirement in
       the geotech report and whether the emails show it was addressed."
-   Not read (listed by name only): old .doc, .xls and .ppt files (save
+   Claude links an email's attachments (the =D12 marks) to the documents
+   file only when both files are in the same chat.
+   Not read (only listed): old .doc, .xls and .ppt files (save
    them as .docx, .xlsx or .pptx), scanned PDFs without text, and CAD
-   files. Of a drawing, only the title block is read.
+   files. Of a drawing, only the title block is read (Squeeze Light
+   also keeps a few lines of its notes).
    Untick the box on the Documents tab to leave attachments out.
 
 Tips
  - Only need a period? Fill in the From / To dates (Emails tab), or point
    Squish at a smaller folder (one month, one subject). A dated run is saved
    as its own file, whose name ends "(only <dates>)", so the all-dates
-   digest is kept.
+   digest is kept. Dates pick emails and their attachments; files in the
+   documents folder (Documents tab) are always included, whatever their
+   date.
  - Only need one topic? Add focus keywords (Squeeze tab), e.g. culvert,
    RFI 12. The file name then says "(focus ...)", and the all-dates digest
    is kept.
@@ -153,9 +162,31 @@ Tips
 # Small helpers (no tkinter)
 # --------------------------------------------------------------------------
 
-def squeeze_options():
-    """[(key, label, description)] from digest.SQUEEZE_LEVELS."""
-    return [(k, v["label"], v.get("description", "")) for k, v in SQUEEZE_LEVELS.items()]
+# What each squeeze level does to the documents file (the size is docdigest.DOC_CAPS' "chars")
+DOC_SQUEEZE_NOTES = {"light": "Documents kept up to about %s characters each.",
+                     "standard": "Long documents condensed to about %s characters each.",
+                     "max": "Documents condensed to about %s characters each."}
+
+
+def squeeze_options(docs_notes=True):
+    """[(key, label, description)] from digest.SQUEEZE_LEVELS. Each description
+    ends with what the level does to the documents file.
+
+    ``docs_notes`` False (the compact layout): the email text only, so each
+    level keeps the line count it had in 1.0 (the Notebook takes the Squeeze
+    tab's height on every tab)."""
+    try:
+        from .docdigest import DOC_CAPS
+    except Exception:       # (the documents code couldn't be loaded)
+        DOC_CAPS = {}
+    options = []
+    for key, level in SQUEEZE_LEVELS.items():
+        text = level.get("description", "")
+        chars = (DOC_CAPS.get(key) or {}).get("chars")
+        if docs_notes and chars and key in DOC_SQUEEZE_NOTES:
+            text = (text + " " + DOC_SQUEEZE_NOTES[key] % fmt_int(chars)).strip()
+        options.append((key, level["label"], text))
+    return options
 
 
 def part_size_options():
@@ -283,16 +314,23 @@ def is_document_name(name):
         return os.path.splitext(name)[1].lower() in DOCUMENT_EXT
 
 
-def count_document_files(folder, include_subfolders, stop, report, skipped=None, skip_folder=""):
-    """Count the files in a documents folder: (documents, other files).
+def count_document_files(folder, include_subfolders, stop, report, skipped=None, skip_folder="",
+                         email_folder=None, email_subfolders=True):
+    """Count the files in a documents folder: (documents, other files, email files).
 
-    Uses the same rules as a run (engine.scan_documents: email files, Squish's
-    own digest files, hidden files and ``skip_folder`` - the output folder - are
-    left out). "Documents" are the files Squish condenses; "other files" are
-    only listed by name. Calls report(files so far) now and then. Returns None
-    if ``stop`` was set. Raises OSError if the folder itself can't be opened;
-    subfolders that can't be opened are added to ``skipped``, if given. Runs in
-    a background thread (no tkinter here).
+    Uses the same rules as a run (engine.scan_documents: the email files the
+    email scan reads - in ``email_folder``, the Emails tab's folder, with
+    ``email_subfolders`` its Include subfolders; all email files without it -,
+    Squish's own digest files, hidden files and ``skip_folder`` - the output
+    folder - are left out; other saved emails count as other files).
+    "Documents" are the files Squish condenses; "other files" are only listed
+    (not read). The email files left out are counted only when there is
+    nothing else, for the "Only emails here" hint (else 0), so a big folder is
+    not walked twice. Calls
+    report(files so far) now and then. Returns None if ``stop`` was set.
+    Raises OSError if the folder itself can't be opened; subfolders that can't
+    be opened are added to ``skipped``, if given. Runs in a background thread
+    (no tkinter here).
     """
     if not os.path.isdir(paths.long_path(folder)):
         raise FileNotFoundError(folder)
@@ -306,7 +344,8 @@ def count_document_files(folder, include_subfolders, stop, report, skipped=None,
             last[0] = time.monotonic()
 
     found = engine.scan_documents(folder, include_subfolders, skip_folder, cancel=stop,
-                                  progress=progress, errors=errors)
+                                  progress=progress, errors=errors, email_folder=email_folder,
+                                  email_subfolders=email_subfolders)
     if found is None or stop.is_set():
         return None
     top = paths.short_path(paths.long_path(folder))    # as scan_documents names it
@@ -316,43 +355,71 @@ def count_document_files(folder, include_subfolders, stop, report, skipped=None,
         if skipped is not None:
             skipped.append(where)
     documents = sum(1 for path, _mtime, _size in found if is_document_name(os.path.basename(path)))
-    return documents, len(found) - documents
+    emails = 0
+    if not found:
+        try:
+            emails = count_email_files(folder, include_subfolders, stop, lambda n: None)
+        except OSError:
+            emails = 0          # (only for a hint: the documents count above stands)
+        if emails is None:
+            return None
+    return documents, len(found) - documents, emails
 
 
 def docs_folder_problem(docs_folder, out_dir):
-    """A message when the documents folder is the output folder or inside it, else ''.
-    (Compared as typed only, like output_folder_problem.)"""
+    """A message when the documents folder is the output folder, else ''. (A
+    folder inside the output folder is fine. Compared as typed only, like
+    output_folder_problem.)"""
     from . import engine
-    if engine.output_inside_source(out_dir, docs_folder, resolve_links=False):
+    if engine.same_folder(docs_folder, out_dir):
         return ("This is where the digests are saved, so Squish won't read documents from it. "
                 "Choose the folder that holds the project's documents.")
     return ""
 
 
-def docs_count_text(documents, others, skipped, subfolders):
+def docs_count_text(documents, others, skipped, subfolders, emails=0):
     """(text, hint style) for the documents folder's file count. ``skipped``:
-    subfolders that couldn't be opened; ``subfolders``: Include subfolders."""
+    subfolders that couldn't be opened; ``subfolders``: Include subfolders;
+    ``emails``: email files there (only used when there is nothing else)."""
     not_opened = (" (%s couldn't be opened)" % plural(skipped, "subfolder")) if skipped else ""
     if documents:
         text = "%s found (%s)%s" % (plural(documents, "document"),
                                     "incl. subfolders" if subfolders else "this folder only",
                                     not_opened)
         if others:
-            text += " - plus %s, listed by name only" % plural(others, "other file")
+            text += " - plus %s, listed, not read" % plural(others, "other file")
         text += "."
         many = documents > MANY_DOCUMENTS
         if many:
             text += (" The first run reads them all, which takes a while; a smaller folder "
                      "(e.g. Reports) is quicker.")
         return text, "Warn" if skipped or many else "Good"
+    style = "Warn"
     if others:
-        text = ("No Word, Excel, PowerPoint, PDF or text files here%s - just %s, which will be "
-                "listed by name." % (not_opened, plural(others, "other file")))
+        # (Other files alone make no documents file: nothing would list them.)
+        text = ("No Word, Excel, PowerPoint, PDF or text files here%s - just %s (e.g. photos, "
+                "CAD, old .doc/.xls), which Squish can't read, so this folder alone won't make a "
+                "documents file." % (not_opened, plural(others, "other file")))
+    elif emails:
+        # e.g. the emails folder itself: fine, but it adds no documents
+        text = ("Only emails here (%s - Squish reads emails from the Emails tab's folder), no "
+                "other documents found%s." % (plural(emails, "email file"), not_opened))
+        style = "Warn" if skipped else "Hint"
     else:
         text = "No files here%s." % not_opened
     if not subfolders:
         text += " Tick 'Include subfolders' to look inside its folders."
-    return text, "Warn"
+    return text, style
+
+
+def docs_folder_blank_hint(attachments):
+    """The documents folder's hint while the box is blank. ``attachments``: the
+    "Condense ... attachments" box is ticked."""
+    if attachments:
+        return ("Optional - for example the project's Reports folder. Leave blank to condense "
+                "only the attachments.")
+    return ("Optional - for example the project's Reports folder. Leave blank for no documents "
+            "folder.")
 
 
 def file_kind(f):
@@ -374,9 +441,10 @@ def kind_counts(files):
 
 def docs_first(files):
     """'the emails file first; add the documents file when you need what the
-    attachments say', with plurals to match ``files``."""
+    documents say', with plurals to match ``files``. (The documents may come from
+    the attachments, the documents folder, or both.)"""
     emails, documents = kind_counts(files)
-    return ("%s first; add %s when you need what the attachments say"
+    return ("%s first; add %s when you need what the documents say"
             % (the_files(emails, "emails"), the_files(documents, "documents")))
 
 
@@ -401,6 +469,10 @@ def done_message(elapsed_s, files, can_copy, other_project="", filters="", part_
     """
     text = "Done in %.0f s - " % (elapsed_s or 0)
     mixed = all(kind_counts(files))     # both emails and documents files
+    if files and not kind_counts(files)[0]:
+        # Only a documents file (no emails were left to write): the keywords
+        # picked documents, not conversations.
+        filters = filters.replace("only conversations mentioning", "only documents mentioning")
     if len(files) == 1:
         text += "1 file ready. Click Show in folder and drag it into Claude"
         if can_copy and not (other_project or filters):
@@ -409,8 +481,9 @@ def done_message(elapsed_s, files, can_copy, other_project="", filters="", part_
         text += ("%d files ready - they fit in one Claude chat. Click Show in folder and drag in "
                  "%s" % (len(files), docs_first(files)))
     elif mixed:
-        text += ("%d files ready - use a new Claude chat for each file, starting with %s. Click "
-                 "Show in folder, then drag one in"
+        text += ("%d files ready - use a new Claude chat for each file, starting with %s "
+                 "(separate chats can't link emails to their attachments). Click Show in "
+                 "folder, then drag one in"
                  % (len(files), the_files(kind_counts(files)[0], "emails")))
     elif fit_one_chat(files, part_size):
         text += ("%d files ready - they fit in one Claude chat. Click Show in folder and drag "
@@ -483,9 +556,12 @@ def results_tip(files, can_copy, part_size=None):
         else:
             start = ("Start a new Claude chat for each file - together they are too big for one "
                      "chat")
-        return ("%s. Begin with %s; use %s when you need what the attachments say. To use one, "
-                "%s." % (start, the_files(emails, "emails"), the_files(documents, "documents"),
-                         how))
+        # (A question about both needs both files in one chat: say how to get a pair that fits.)
+        return ("%s. Begin with %s; use %s when you need what the documents say. Claude links "
+                "emails to their attachments (the =D12 marks) only when both files are in the "
+                "same chat - for that, narrow the run with dates or Focus keywords. To use one, "
+                "%s."
+                % (start, the_files(emails, "emails"), the_files(documents, "documents"), how))
     if documents:
         start = "%d documents files (the Dates column shows what each covers). " % len(files)
     else:
@@ -560,6 +636,10 @@ def summary_text(result):
             plural(found, "email"), fmt_int(stats.get("emails_used", 0)),
             plural(stats.get("threads", 0), "thread"),
             plural(len(files), "emails file" if doc_files else "file"), fmt_tokens(tokens))
+    elif doc_files:
+        # (engine.run_project: such a run writes no emails file and keeps the earlier ones)
+        text = ("%s read, but none were left to write, so this run made only a documents file "
+                "(any earlier emails files were kept)." % plural(found, "email"))
     else:
         text = ("%s read, but none were left to write - check the dates and focus keywords."
                 % plural(found, "email"))
@@ -588,36 +668,134 @@ def summary_text(result):
         text += " %s in a folder Squish can't open %s left out (see run log)." % (
             plural(stats["no_access_emails"], "email"),
             "is" if stats["no_access_emails"] == 1 else "are")
-    documents = documents_summary(stats, doc_files)
-    if documents:
-        text += " " + documents
     docs_failed, docs_folders = doc_problem_counts(result)
-    if docs_failed:
+    documents = documents_summary(stats, doc_files, docs_failed)
+    # (documents wanted, but no documents file: it says why, unreadable ones included)
+    no_documents = no_documents_note(result)
+    if documents:
+        text += " " + documents + undated_docs_note(doc_files)
+    elif docs_failed and not no_documents:
         text += " %s couldn't be read (see run log)." % plural(docs_failed, "document")
-    if docs_folders:
+    if no_documents:
+        text += " " + no_documents
+    text += docs_digest_warning(result)
+    if docs_folder_is_output(result):
+        text += " The documents folder is the output folder, so it was skipped (see run log)."
+    elif docs_folders:
         text += " The documents folder (or a folder in it) couldn't be opened (see run log)."
     return text
 
 
-def documents_summary(stats, doc_files):
-    """'73 documents condensed (incl. 9 drawings) into 1 documents file, ~43k tokens,
-    plus 31 other files listed.' for a run that wrote a documents file
-    (``doc_files``), else ''. Drawings count as documents here, as in the
-    Contains column."""
+def documents_summary(stats, doc_files, failed=0):
+    """'73 documents (incl. 9 drawings) in 1 documents file, ~43k tokens, plus 31
+    other files listed (3 of them couldn't be read - see run log).' for a
+    run that wrote a documents file (``doc_files``), else ''. Drawings count as
+    documents here, as in the Contains column. ``failed``: documents that
+    couldn't be read; they are among the other files listed, so they are
+    counted there (a separate sentence when they are not all among them)."""
     if not doc_files:
         return ""
     drawings = int(stats.get("doc_drawings") or 0)
     count = int(stats.get("documents") or 0) + drawings
     if not count:
         return ""
-    text = "%s condensed" % plural(count, "document")
+    text = plural(count, "document")
     if drawings:
         text += " (incl. %s)" % plural(drawings, "drawing")
-    text += " into %s, ~%s tokens" % (plural(len(doc_files), "documents file"),
-                                      fmt_tokens(sum(int(f.get("est_tokens") or 0) for f in doc_files)))
-    if stats.get("doc_other"):
-        text += ", plus %s listed" % plural(stats["doc_other"], "other file")
-    return text + "."
+    text += " in %s, ~%s tokens" % (plural(len(doc_files), "documents file"),
+                                    fmt_tokens(sum(int(f.get("est_tokens") or 0) for f in doc_files)))
+    others = int(stats.get("doc_other") or 0)
+    if others:
+        text += ", plus %s listed" % plural(others, "other file")
+    if failed and failed <= others:
+        if others == 1:
+            text += " (it couldn't be read - see run log)"
+        elif failed == others:
+            text += " (none of them could be read - see run log)"
+        else:
+            text += " (%s of them couldn't be read - see run log)" % fmt_int(failed)
+        failed = 0
+    text += "."
+    if failed:
+        text += " %s couldn't be read (see run log)." % plural(failed, "document")
+    return text
+
+
+def undated_docs_note(files):
+    """A sentence for a dated run whose documents file covers dates outside the
+    run's dates (the files in the documents folder are never left out for their
+    date; see engine.run_project), else ''. Read from the file names' '(only ...)'
+    tag and the files' first and last dates, so a saved last_run works too."""
+    docs = [f for f in files if file_kind(f) == "documents"]
+    for f in docs:
+        match = ONLY_DATES_RE.search(os.path.basename(f.get("path") or ""))
+        if not match:
+            continue
+        start = match.group(1) or match.group(3) or ""
+        end = match.group(2) or match.group(4) or ""
+        first = (f.get("first_date") or "")[:10]
+        last = (f.get("last_date") or "")[:10]
+        if (start and first and first < start) or (end and last and last > end):
+            return (" The documents file%s also %s the files in the documents folder, whatever "
+                    "their date (attachments follow the dates)."
+                    % (("", "has") if len(docs) == 1 else ("s", "have")))
+    return ""
+
+
+def docs_folder_warning(result):
+    """' The documents folder (or a folder in it) couldn't be opened, so its
+    documents are missing - see run log.' for the Done message of a run whose
+    documents folder couldn't be read, else ''. A documents folder that is the
+    output folder is skipped, not missing: that gets its own sentence. (The
+    summary says so too, but the status line is what people read first.)"""
+    if docs_folder_is_output(result):
+        return " The documents folder is the output folder, so it was skipped - see run log."
+    if not doc_problem_counts(result)[1]:
+        return ""
+    return (" The documents folder (or a folder in it) couldn't be opened, so its documents are "
+            "missing - see run log.")
+
+
+def docs_folder_is_output(result):
+    """True if the run skipped the documents folder because it is the output
+    folder (a RunResult's doc_problems, or a saved last_run's
+    doc_folder_is_output). The Documents tab warns about it before the run."""
+    problems = result.get("doc_problems")
+    if problems is None:
+        return bool(result.get("doc_folder_is_output"))
+    return any(projects.is_docs_folder_output_problem(item[1]) for item in problems)
+
+
+def docs_digest_warning(result):
+    """' The documents file couldn't be made this time ...' for a run (or saved
+    last_run) whose documents digest failed (engine: doc_digest_failed), else ''.
+    Such a run keeps any earlier documents file, so say that it is out of date."""
+    if not result.get("doc_digest_failed"):
+        return ""
+    emails = kind_counts(result.get("files") or [])[0]
+    if not emails:
+        return " The documents file couldn't be made either (see run log)."
+    return (" The documents file couldn't be made this time (see run log), so only %s %s "
+            "written - any documents file already in the folder is from an earlier run."
+            % (the_files(emails, "emails"), "was" if emails == 1 else "were"))
+
+
+def no_documents_note(result):
+    """'No documents file: ...' for a run that wanted documents (attachments or a
+    documents folder) but wrote no documents file, else ''. Uses the run's
+    stats["doc_found"]: the files its documents digest would list (after the
+    focus keywords), which engine.run_project sets only when documents were
+    wanted. A failed documents digest has its own sentence (docs_digest_warning)."""
+    found = (result.get("stats") or {}).get("doc_found")
+    files = result.get("files") or []
+    if found is None or result.get("doc_digest_failed") or kind_counts(files)[1]:
+        return ""
+    if found:
+        return ("No documents file: none of the %s found could be read (see run log)."
+                % plural(found, "file"))
+    if any(" (focus " in os.path.basename(f.get("path") or "") for f in files):
+        return "No documents file: no documents match the focus keywords."
+    return "No documents file: no documents were found."
 
 
 def doc_problem_counts(result):
@@ -763,7 +941,8 @@ def pdf_reader_text(status):
     if not status:
         return "unavailable (Squish's document reader couldn't be loaded)", "Warn"
     if status.startswith("PDF: pypdf"):
-        return status[len("PDF: "):].strip(), "Hint"
+        version = status[len("PDF: "):].strip()          # e.g. 'pypdf 5.1.0'
+        return "Installed (%s) - PDFs are read with the better reader." % version, "Hint"
     return PDF_ADVICE, "Hint"
 
 
@@ -854,7 +1033,7 @@ class SettingsForm(ttk.Notebook):
         self.compact = getattr(app, "compact", False)   # short screen: tighter spacing
         self.wraps = []          # (label, container, margin): labels that wrap to the width
         self.keep_hints = []     # hints shown even in the compact layout (see set_hint)
-        self.squeeze_choices = squeeze_options()
+        self.squeeze_choices = squeeze_options(docs_notes=not self.compact)
         self.size_choices = part_size_options()
 
         self.name_var = tk.StringVar()
@@ -1037,8 +1216,8 @@ class SettingsForm(ttk.Notebook):
         self._label(tab, 3, "Focus keywords")
         self.keywords_entry = ttk.Entry(tab, textvariable=self.keywords_var)
         self.keywords_entry.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(px(3), 0))
-        self._hint(tab, 4, "Optional. Keep only conversations that mention any of these "
-                           "words, e.g. culvert, pump station, RFI 12 (RFI 12 also finds "
+        self._hint(tab, 4, "Optional. Keep only conversations (and documents) that mention any "
+                           "of these words, e.g. culvert, pump station, RFI 12 (RFI 12 also finds "
                            "RFI-012, RFI_12 and RFI #12). They stay set for this project until "
                            "you clear them.")
 
@@ -1222,7 +1401,7 @@ class SettingsForm(ttk.Notebook):
             else:
                 default = paths.default_output_folder(v["name"] or projects.DEFAULT_NAME)
                 self.set_hint(self.output_hint, "Leave blank to use %s" % default)
-        if field in (None, "date_from", "date_to", "focus_keywords"):
+        if field in (None, "date_from", "date_to", "focus_keywords", "docs_folder"):
             # The Emails tab (the one Squish opens on) says when a filter is on,
             # so a one-off topic or date run doesn't quietly become the normal run.
             problem = date_problem(v["date_from"]) or date_problem(v["date_to"])
@@ -1238,7 +1417,9 @@ class SettingsForm(ttk.Notebook):
             elif v["date_from"] or v["date_to"]:
                 self.set_hint(self.dates_hint, "Only these dates are squished, into a file whose "
                               "name ends \"(only <dates>)\". Clear both boxes for the full "
-                              "digest; it is kept meanwhile.")
+                              "digest; it is kept meanwhile." +
+                              (" Files in the documents folder are included whatever their date."
+                               if v["docs_folder"] else ""))
             else:
                 self.set_hint(self.dates_hint, "Leave blank for all dates. To pick one topic, add "
                               "Focus keywords (Squeeze tab). A dated or keyword run is saved as "
@@ -1460,9 +1641,11 @@ class ResultsPanel(ttk.LabelFrame):
             self.tree.focus("0")
             text = summary_text(result)
             if run_was_filtered(result):
-                text += (" %s only part of the emails - for the full digest, clear the dates "
+                # (a run that left no emails wrote only a documents file)
+                text += (" %s only part of the %s - for the full digest, clear the dates "
                          "and focus keywords and click Squish!"
-                         % ("This file has" if len(self.files) == 1 else "These files have"))
+                         % ("This file has" if len(self.files) == 1 else "These files have",
+                            "emails" if kind_counts(self.files)[0] else "documents"))
         elif result.get("files") and not reachable:
             folder = self.output_folder or os.path.dirname(result["files"][0].get("path") or "")
             text = ("Can't reach %s. If it's on a network drive, check you're connected to the "
@@ -1924,16 +2107,18 @@ class SquishApp(object):
             ttk.Label(inner, image=image).pack(pady=(0, px(12)))
         ttk.Label(inner, text="Welcome to Squish", font=self.fonts["welcome"]).pack()
         ttk.Label(inner, justify="center", wraplength=px(460), text=(
-            "Squish reads a folder of saved Outlook emails and squashes them into one small "
-            "text file you can drag into Claude - so Claude can track the correspondence and "
-            "the actions for you.\n\nMake a project for each job you want to keep an eye on.")
+            "Squish reads a project's saved Outlook emails - and the Word, Excel, PowerPoint "
+            "and PDF documents with them - and squashes them into small text files you can drag "
+            "into Claude, so Claude can track the correspondence and the actions for you.\n\n"
+            "Make a project for each job you want to keep an eye on.")
         ).pack(pady=(px(8), px(18)))
         tk.Button(inner, text="Create your first project", command=self.new_project,
                   font=self.fonts["big"], background=COLOURS["accent"],
                   foreground=COLOURS["on_accent"], activebackground=COLOURS["accent_active"],
                   activeforeground=COLOURS["on_accent"], relief="flat", borderwidth=0,
                   cursor="hand2", padx=px(22), pady=px(9)).pack()
-        ttk.Label(inner, text="Squish only reads your emails. It never changes or deletes them.",
+        ttk.Label(inner, text="Squish only reads your emails and documents. It never changes "
+                              "or deletes them.",
                   style="Hint.TLabel").pack(pady=(px(14), 0))
 
     def _build_editor(self, parent):
@@ -2156,8 +2341,11 @@ class SquishApp(object):
             self._rename_in_list(project)
         if field in ("source_folder", "include_subfolders"):
             self.schedule_count()
-        if field in ("docs_folder", "docs_include_subfolders", "output_folder"):
+        if field in ("docs_folder", "docs_include_subfolders", "output_folder", "source_folder",
+                     "include_subfolders"):
             self.schedule_docs_count()
+        elif field == "docs_from_attachments" and not project.get("docs_folder"):
+            self.schedule_docs_count(delay=0)    # the blank folder's hint depends on it
         self.schedule_save()
 
     def schedule_save(self):
@@ -2328,8 +2516,7 @@ class SquishApp(object):
         folder = values["docs_folder"]
         hint = self.form.docs_hint
         if not folder:
-            self.form.set_hint(hint, "Optional - for example the project's Reports folder. "
-                               "Leave blank to condense only the attachments.")
+            self.form.set_hint(hint, docs_folder_blank_hint(values["docs_from_attachments"]))
             return
         out_dir = values["output_folder"] or str(paths.default_output_folder(
             values["name"] or projects.DEFAULT_NAME))
@@ -2340,6 +2527,8 @@ class SquishApp(object):
         stop = threading.Event()
         self.docs_count_stop = stop
         subfolders = values["docs_include_subfolders"]
+        email_folder = values["source_folder"] or None
+        email_subfolders = values["include_subfolders"]
         self.form.set_hint(hint, "Counting documents...")
 
         def work():
@@ -2347,7 +2536,8 @@ class SquishApp(object):
             try:
                 counts = count_document_files(
                     folder, subfolders, stop,
-                    lambda n: self.post(("docs_count", token, "progress", n)), skipped, out_dir)
+                    lambda n: self.post(("docs_count", token, "progress", n)), skipped, out_dir,
+                    email_folder, email_subfolders)
                 if counts is not None:
                     self.post(("docs_count", token, "done", counts, len(skipped)))
             except FileNotFoundError:
@@ -2367,7 +2557,9 @@ class SquishApp(object):
         if kind == "progress":
             self.form.set_hint(hint, "Counting documents... %s files so far" % fmt_int(value))
         elif kind == "done":
-            self.form.set_hint(hint, *docs_count_text(value[0], value[1], skipped, subfolders))
+            documents, others, emails = value
+            self.form.set_hint(hint, *docs_count_text(documents, others, skipped, subfolders,
+                                                      emails))
         elif kind == "missing":
             self.form.set_hint(hint, "Can't find this folder, so Squish will skip it. If it's on "
                                "a network drive (like H:), check you're connected to the office "
@@ -2414,7 +2606,8 @@ class SquishApp(object):
         self.run = {"id": self.run_counter, "project_id": project["id"],
                     "name": project["name"], "cancel": threading.Event(), "stage": "scan",
                     "started": time.time(), "filters": filter_summary(project),
-                    "part_size": project.get("part_size")}
+                    "part_size": project.get("part_size"),
+                    "attachments": bool(project.get("docs_from_attachments", True))}
         self.stopped.pop(project["id"], None)   # an earlier stop no longer applies
         work_copy = copy.deepcopy(project)
         # The files the last run wrote, so the engine can tidy them up even if
@@ -2484,10 +2677,17 @@ class SquishApp(object):
                 self.progress.stop()
                 self.progress.configure(mode="determinate")
             self.progress.configure(maximum=total, value=done)
-            if stage == "read":
+            if stage == "read" and self.run.get("attachments"):
+                # (attachments are condensed while the emails are read: a slower stage)
+                message = "Reading emails and attachments %s of %s..." % (fmt_int(done),
+                                                                          fmt_int(total))
+            elif stage == "read":
                 message = "Reading %s of %s emails..." % (fmt_int(done), fmt_int(total))
             elif stage == "documents":
-                message = "Condensing documents %s of %s..." % (fmt_int(done), fmt_int(total))
+                # (it counts files: the documents folder's other files are among them,
+                # like the engine's 'Found 57 files')
+                message = "Condensing documents: %s of %s files..." % (fmt_int(done),
+                                                                        fmt_int(total))
             self.set_status(prefix + (message or ("Saving..." if stage == "write" else "Working...")))
         else:
             if str(self.progress.cget("mode")) != "indeterminate":
@@ -2516,8 +2716,9 @@ class SquishApp(object):
             # keep showing them (last_run is left as it was).
             had_files = project is not None and (project.get("last_run") or {}).get("files")
             self.set_status(prefix + "Finished, but no emails were left to write (check the "
-                            "dates and focus keywords)%s." % (
-                                " - your earlier digest files were kept" if had_files else ""),
+                            "dates and focus keywords)%s.%s" % (
+                                " - your earlier digest files were kept" if had_files else "",
+                                docs_digest_warning(result)),
                             "Warn")
             if on_screen:
                 self.show_last_run(project)
@@ -2531,11 +2732,14 @@ class SquishApp(object):
             self.results.show(result, part_size=run.get("part_size"))
         other = "" if project is None or on_screen else short_name(run["name"])
         # Amber, not green, when emails may be missing (files that couldn't be
-        # read, folders that couldn't be opened): the summary says which.
+        # read, folders that couldn't be opened): the summary says which. The
+        # same when the documents folder couldn't be read or the documents file
+        # couldn't be made.
         missing = (any(failure_counts(result)) or (result.get("stats") or {}).get("no_access_emails")
-                   or doc_problem_counts(result)[1])   # (or the documents folder couldn't be read)
+                   or doc_problem_counts(result)[1] or result.get("doc_digest_failed"))
         self.set_status(done_message(result.get("elapsed_s", 0), files, can_copy_files(), other,
-                                     run.get("filters", ""), run.get("part_size")),
+                                     run.get("filters", ""), run.get("part_size"))
+                        + docs_folder_warning(result) + docs_digest_warning(result),
                         "Warn" if missing else "Good")
 
     def _run_error(self, run_id, message, log_path=""):

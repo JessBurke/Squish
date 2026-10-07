@@ -1960,16 +1960,21 @@ def fact_score(piece):
     return _fact_score(piece)
 
 
-def fact_pieces(text, size):
+def fact_pieces(text, size, sentences=False):
     """(start, end) pieces of text as cap_text sees it: sentences, or table/list
     runs that end at a fact; a piece over `size` characters that holds facts is
     split further at its list items, then at clause breaks. For callers that
-    choose the pieces themselves (the documents digest)."""
+    choose the pieces themselves (the documents digest). With sentences=True,
+    returns (pieces, sentence numbers): for each piece, the number of the
+    sentence (or run) it was cut from, so a clause can be kept with its start."""
     units = _cap_units(text)
     if not units:
-        return []
-    pieces, _whole = _fine_units(text, [(0, 0)] + units, size)
-    return [(a, b) for a, b in pieces[1:] if text[a:b].strip()]
+        return ([], []) if sentences else []
+    pieces, whole = _fine_units(text, [(0, 0)] + units, size)
+    kept = [(span, n) for span, n in zip(pieces[1:], whole[1:]) if text[span[0]:span[1]].strip()]
+    if sentences:
+        return [span for span, _n in kept], [n for _span, n in kept]
+    return [span for span, _n in kept]
 
 
 def _cut_at(text, limit):

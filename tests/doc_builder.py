@@ -19,6 +19,10 @@ A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 WPS_NS = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
 V_NS = "urn:schemas-microsoft-com:vml"
+M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+DGM_NS = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+XDR_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+C_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
 
 XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
 
@@ -195,27 +199,85 @@ def comments_xml(comments):
     return XML_HEAD + '<w:comments xmlns:w="%s">%s</w:comments>' % (W_NS, items)
 
 
+# Namespaces declared on the root of every Word part written here.
+_W_ROOT_NS = ('xmlns:w="%s" xmlns:r="%s" xmlns:mc="%s" xmlns:wps="%s" xmlns:v="%s" xmlns:m="%s" '
+              'xmlns:a="%s" xmlns:dgm="%s"' % (W_NS, R_NS, MC_NS, WPS_NS, V_NS, M_NS, A_NS, DGM_NS))
+
+
 def hdr_xml(kind, *paragraphs):
     tag = "hdr" if kind == "header" else "ftr"
-    return XML_HEAD + '<w:%s xmlns:w="%s">%s</w:%s>' % (tag, W_NS, "".join(paragraphs), tag)
+    return XML_HEAD + '<w:%s %s>%s</w:%s>' % (tag, _W_ROOT_NS, "".join(paragraphs), tag)
 
 
 def document_xml(body):
-    return (XML_HEAD + '<w:document xmlns:w="%s" xmlns:r="%s" xmlns:mc="%s" xmlns:wps="%s" '
-            'xmlns:v="%s"><w:body>%s<w:sectPr/></w:body></w:document>'
-            % (W_NS, R_NS, MC_NS, WPS_NS, V_NS, body))
+    return XML_HEAD + '<w:document %s><w:body>%s<w:sectPr/></w:body></w:document>' % (_W_ROOT_NS, body)
+
+
+def math(*parts):
+    """An m:oMath equation from raw Office Math XML parts (see mr)."""
+    return "<m:oMath>%s</m:oMath>" % "".join(parts)
+
+
+def mr(text):
+    """An Office Math run (m:r) with a little of the formatting Word writes around it."""
+    return ('<m:r><m:rPr><m:sty m:val="p"/></m:rPr><w:rPr><w:rFonts w:ascii="Cambria Math"/></w:rPr>'
+            '<m:t>%s</m:t></m:r>' % escape(text))
+
+
+def sup_run(text, align="superscript"):
+    """A w:r raised (superscript) or lowered (subscript)."""
+    return ('<w:r><w:rPr><w:vertAlign w:val="%s"/></w:rPr><w:t xml:space="preserve">%s</w:t></w:r>'
+            % (align, escape(text)))
+
+
+def font_run(font, text):
+    """A w:r set in ``font`` (e.g. Symbol, where "m" shows as μ)."""
+    return ('<w:r><w:rPr><w:rFonts w:ascii="%s" w:hAnsi="%s"/></w:rPr><w:t xml:space="preserve">%s</w:t></w:r>'
+            % (font, font, escape(text)))
+
+
+def diagram_data_xml(*texts):
+    """A SmartArt data part with one point per text (plus the empty document point)."""
+    points = ['<dgm:pt modelId="0" type="doc"><dgm:prSet/><dgm:spPr/><dgm:t><a:bodyPr/><a:p/></dgm:t></dgm:pt>']
+    for i, text in enumerate(texts, 1):
+        points.append('<dgm:pt modelId="%d"><dgm:prSet/><dgm:spPr/><dgm:t><a:bodyPr/><a:p><a:r><a:t>%s'
+                      '</a:t></a:r></a:p></dgm:t></dgm:pt>' % (i, escape(text)))
+    return (XML_HEAD + '<dgm:dataModel xmlns:dgm="%s" xmlns:a="%s"><dgm:ptLst>%s</dgm:ptLst></dgm:dataModel>'
+            % (DGM_NS, A_NS, "".join(points)))
+
+
+def smartart(rid):
+    """A run holding a SmartArt drawing whose data part has relationship id ``rid``."""
+    return ('<w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/'
+            'wordprocessingDrawing"><wp:docPr id="1" name="Diagram 1"/><a:graphic><a:graphicData uri="%s">'
+            '<dgm:relIds r:dm="%s" r:lo="rIdL" r:qs="rIdQ" r:cs="rIdC"/></a:graphicData></a:graphic>'
+            '</wp:inline></w:drawing></w:r>' % (DGM_NS, rid))
+
+
+def watermark(text):
+    """A header paragraph holding Word's VML text watermark (with the shape type it uses)."""
+    return ('<w:p><w:r><w:pict><v:shapetype id="_x0000_t136" coordsize="21600,21600"><v:textpath on="t" '
+            'fitshape="t"/></v:shapetype><v:shape id="PowerPlusWaterMarkObject1" type="#_x0000_t136">'
+            '<v:textpath style="font-family:Calibri" string="%s"/></v:shape></w:pict></w:r></w:p>' % escape(text))
 
 
 def docx(body, title=None, styles=True, numbering=False, footnotes=None, endnotes=None,
-         comments=None, headers=(), footers=(), pages=None, raw_document=None):
-    """A .docx whose body is ``body`` (XML of w:p / w:tbl elements)."""
+         comments=None, headers=(), footers=(), pages=None, raw_document=None, extra_parts=None,
+         extra_rels=()):
+    """A .docx whose body is ``body`` (XML of w:p / w:tbl elements).
+
+    ``numbering`` is True (the standard test lists) or a numbering part's XML.
+    ``extra_parts`` {name: XML} and ``extra_rels`` [(id, type, target)] add parts
+    related to the main document (e.g. SmartArt data).
+    """
     parts = {"word/document.xml": raw_document if raw_document is not None else document_xml(body)}
-    rels = []
+    rels = list(extra_rels)
+    parts.update(extra_parts or {})
     if styles:
         parts["word/styles.xml"] = styles_xml()
         rels.append(("rId1", "styles", "styles.xml"))
     if numbering:
-        parts["word/numbering.xml"] = numbering_xml()
+        parts["word/numbering.xml"] = numbering if isinstance(numbering, str) else numbering_xml()
         rels.append(("rId2", "numbering", "numbering.xml"))
     if footnotes:
         parts["word/footnotes.xml"] = notes_xml("footnotes", footnotes)
@@ -277,6 +339,31 @@ def sheet_xml(rows):
         S_NS, body)
 
 
+def drawing_xml(*anchors):
+    """A spreadsheet drawing part (xdr:wsDr) holding these anchors (see text_box_anchor)."""
+    return (XML_HEAD + '<xdr:wsDr xmlns:xdr="%s" xmlns:a="%s" xmlns:r="%s" xmlns:mc="%s" xmlns:c="%s">%s'
+            '</xdr:wsDr>' % (XDR_NS, A_NS, R_NS, MC_NS, C_NS, "".join(anchors)))
+
+
+def xdr_shape(paragraphs, name="TextBox 1", hidden=False):
+    """An xdr:sp text box with these paragraphs."""
+    hide = ' hidden="1"' if hidden else ""
+    paras = "".join('<a:p><a:r><a:t>%s</a:t></a:r></a:p>' % escape(t) for t in paragraphs)
+    return ('<xdr:sp><xdr:nvSpPr><xdr:cNvPr id="2" name="%s"%s/><xdr:cNvSpPr txBox="1"/></xdr:nvSpPr>'
+            '<xdr:spPr/><xdr:txBody><a:bodyPr/>%s</xdr:txBody></xdr:sp>' % (escape(name), hide, paras))
+
+
+def anchor(content):
+    """A two-cell anchor around a shape, group or chart frame."""
+    return ('<xdr:twoCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:row>1</xdr:row></xdr:from><xdr:to>'
+            '<xdr:col>8</xdr:col><xdr:row>6</xdr:row></xdr:to>%s<xdr:clientData/></xdr:twoCellAnchor>' % content)
+
+
+CHART_FRAME = ('<xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="4" name="Chart 1"/><xdr:cNvGraphicFramePr/>'
+               '</xdr:nvGraphicFramePr><xdr:xfrm/><a:graphic><a:graphicData uri="%s"><c:chart r:id="rId9"/>'
+               '</a:graphicData></a:graphic></xdr:graphicFrame>' % C_NS)
+
+
 def shared_strings_xml(strings):
     """sharedStrings.xml; a string given as a list is written as rich-text runs."""
     items = []
@@ -336,8 +423,10 @@ def xlsx(sheets, shared=None, date1904=False, title=None, styles=STYLES_XLSX, sh
 # --------------------------------------------------------------------------
 
 def _shape(texts, ph_type=None):
+    """A shape; each text is a paragraph (raw XML when it starts with '<a:p')."""
     ph = '<p:ph type="%s"/>' % ph_type if ph_type else ""
-    paras = "".join('<a:p><a:r><a:t>%s</a:t></a:r></a:p>' % escape(t) for t in texts)
+    paras = "".join(t if t.startswith("<a:p") else '<a:p><a:r><a:t>%s</a:t></a:r></a:p>' % escape(t)
+                    for t in texts)
     return ('<p:sp><p:nvSpPr><p:cNvPr id="2" name="Shape"/><p:cNvSpPr/><p:nvPr>%s</p:nvPr></p:nvSpPr>'
             '<p:spPr/><p:txBody><a:bodyPr/>%s</p:txBody></p:sp>' % (ph, paras))
 
@@ -351,7 +440,15 @@ def _ppt_table(rows):
             '</a:graphic></p:graphicFrame>' % trs)
 
 
-def slide_xml(title=None, body=(), table_rows=None, footer=None, extra_shapes=""):
+def autonum(text, scheme="arabicPeriod", start=None, level=0):
+    """A raw a:p paragraph numbered automatically by PowerPoint (a:buAutoNum)."""
+    at = ' startAt="%d"' % start if start else ""
+    lvl = ' lvl="%d"' % level if level else ""
+    return ('<a:p><a:pPr%s><a:buAutoNum type="%s"%s/></a:pPr><a:r><a:t>%s</a:t></a:r></a:p>'
+            % (lvl, scheme, at, escape(text)))
+
+
+def slide_xml(title=None, body=(), table_rows=None, footer=None, extra_shapes="", hidden=False):
     """A slide: other shapes are written first so the title is not first in tree order."""
     shapes = ""
     if body:
@@ -363,9 +460,10 @@ def slide_xml(title=None, body=(), table_rows=None, footer=None, extra_shapes=""
     if title is not None:
         shapes += _shape([title], "title")
     shapes += extra_shapes
-    return (XML_HEAD + '<p:sld xmlns:p="%s" xmlns:a="%s" xmlns:r="%s"><p:cSld><p:spTree>'
+    show = ' show="0"' if hidden else ""
+    return (XML_HEAD + '<p:sld xmlns:p="%s" xmlns:a="%s" xmlns:r="%s"%s><p:cSld><p:spTree>'
             '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>'
-            '%s</p:spTree></p:cSld></p:sld>' % (P_NS, A_NS, R_NS, shapes))
+            '%s</p:spTree></p:cSld></p:sld>' % (P_NS, A_NS, R_NS, show, shapes))
 
 
 def notes_slide_xml(text):
@@ -374,7 +472,7 @@ def notes_slide_xml(text):
 
 
 def pptx(slides, title=None):
-    """A .pptx from slides: dicts with title, body (list), table (rows), notes, footer.
+    """A .pptx from slides: dicts with title, body (list), table (rows), notes, footer, hidden.
 
     Slide parts are numbered in reverse so only presentation.xml's list gives the order.
     """
@@ -386,7 +484,7 @@ def pptx(slides, title=None):
         part_no = n - i + 1
         name = "slide%d.xml" % part_no
         parts["ppt/slides/" + name] = slide_xml(s.get("title"), s.get("body", ()), s.get("table"),
-                                                s.get("footer"))
+                                                s.get("footer"), hidden=s.get("hidden", False))
         srels = []
         if s.get("notes"):
             parts["ppt/notesSlides/notesSlide%d.xml" % part_no] = notes_slide_xml(s["notes"])

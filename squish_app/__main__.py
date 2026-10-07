@@ -16,7 +16,7 @@ import tempfile
 import time
 import traceback
 
-USAGE = """Squish - squash a folder of emails into one file you can drop into Claude.
+USAGE = """Squish - squash a project's emails and documents into small files you can drop into Claude.
 
   Squish.pyw                         open the Squish window
   Squish.pyw run "Project name"      run a saved project without the window

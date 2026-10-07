@@ -5,7 +5,8 @@ rem ----------------------------------------------------------------------
 rem  Squish - one-time setup. Double-click this file.
 rem
 rem  1. finds Python (the "py" launcher first, then "python")
-rem  2. installs the optional Outlook and PDF reader packages (extract-msg, pypdf)
+rem  2. installs the optional Outlook and PDF reader packages (extract-msg,
+rem     pypdf, and cryptography for secured PDFs)
 rem  3. makes the Squish shortcuts on the Desktop and in the Start Menu
 rem
 rem  Written with goto labels instead of bracketed if-blocks, so folder
@@ -95,11 +96,25 @@ echo  Installing the optional PDF reader (pypdf)...
 %PY% -m pip install --user --upgrade --disable-pip-version-check --quiet --timeout 20 --retries 1 pypdf >"%TEMP%\squish-pip-pdf-log.txt" 2>&1
 if errorlevel 1 goto :pdffailed
 echo  PDF support: installed
-goto :shortcuts
+goto :pdfcrypto
 
 :pdffailed
 echo  PDF support: Squish's built-in reader will be used
 echo  (Couldn't install pypdf - the details are in squish-pip-pdf-log.txt in your Temp folder.)
+goto :shortcuts
+
+rem ---- 2c. Optional support for secured PDFs (pypdf + cryptography) -------
+rem A separate step, not "pypdf[crypto]": if cryptography can't be installed,
+rem pypdf must still be. Without it Squish's built-in reader opens those PDFs.
+:pdfcrypto
+%PY% -m pip install --user --upgrade --disable-pip-version-check --quiet --timeout 20 --retries 1 cryptography >"%TEMP%\squish-pip-crypto-log.txt" 2>&1
+if errorlevel 1 goto :cryptofailed
+echo  Secured PDF support: installed
+goto :shortcuts
+
+:cryptofailed
+echo  Secured PDF support: Squish's built-in reader will be used for those
+echo  (Couldn't install cryptography - the details are in squish-pip-crypto-log.txt in your Temp folder.)
 goto :shortcuts
 
 rem ---- 3. Shortcuts ---------------------------------------------------------

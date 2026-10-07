@@ -36,7 +36,8 @@ attachments that docs.py can condense (a supported extension, at most
 docs.DOC_MAX_BYTES) are kept in a transient "_data" entry, plus "sha1" (of the
 bytes) and "doc_size". The engine hands "_data" to docs.extract and removes it
 before the record is cached; it is never written anywhere. Attachments of an
-attached email are not read (one level only).
+attached email are not read (one level only). A .msg attachment that is only a
+link to a shared file (an Outlook cloud attachment) gets "link": True.
 
 Set the environment variable SQUISH_NO_EXTRACT_MSG=1 to always use the
 built-in .msg reader (handy for troubleshooting).
@@ -67,6 +68,11 @@ EXTRACT_MSG_MAX_BYTES = 2 * 1024 * 1024
 
 # The text of an attached email is kept up to this many characters.
 EMBEDDED_BODY_MAX = 30000
+
+# PR_ATTACH_METHOD values of an attachment that is a link to a file, not the
+# file (by reference, by reference resolve, by reference only, and Outlook's
+# cloud attachments: OneDrive / SharePoint). Such attachments get "link": True.
+LINK_METHODS = (2, 3, 4, 7)
 
 READER_EXTRACT_MSG = "extract_msg"
 READER_BUILTIN_MSG = "builtin_msg"
@@ -920,6 +926,8 @@ def _record_from_msg_fields(display, f, reader, want_docs=False):
         }
         if isinstance(a.get("data"), bytes) and not a.get("embedded"):
             entry["data"] = a["data"]   # raw bytes; read_email keeps documents' only
+        if a.get("method") in LINK_METHODS and not a.get("embedded"):
+            entry["link"] = True        # a link to a shared file (OneDrive, SharePoint), no bytes
         rec["attachments"].append(entry)
 
     rec["auto_reply"] = is_auto_reply(rec["item_class"], rec["subject"], get_header)

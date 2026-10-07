@@ -326,7 +326,20 @@ def last_run_from_result(result):
     saved["doc_problem_count"] = len(doc_problems)
     saved["doc_problem_folders"] = sum(1 for item in doc_problems
                                        if engine.is_doc_folder_problem(item[1]))
+    # The documents folder was skipped because it is the output folder (not
+    # "couldn't be opened"), and the documents digest couldn't be made (the
+    # earlier documents file was kept): the window words these differently.
+    saved["doc_folder_is_output"] = any(is_docs_folder_output_problem(item[1])
+                                        for item in doc_problems)
+    saved["doc_digest_failed"] = bool(result.get("doc_digest_failed"))
     return saved
+
+
+def is_docs_folder_output_problem(message):
+    """True for a ``doc_problems`` entry saying the documents folder was not read
+    because it is the output folder (engine._scan_documents_folder)."""
+    from . import engine
+    return (message or "").startswith(engine._DOCS_FOLDER_IS_OUTPUT)
 
 
 def record_last_run(project_id, result):

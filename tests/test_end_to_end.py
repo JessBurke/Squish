@@ -7,7 +7,9 @@ helpers all agree on the same names and shapes).
 All names, addresses and text are made up.
 """
 
+import gzip
 import io
+import json
 import os
 import re
 import shutil
@@ -423,6 +425,8 @@ def documents_job(root):
         "Old minutes.doc": b"\xd0\xcf\x11\xe0 synthetic old Word file",
         "~$Rates.xlsx": b"lock file",
         "desktop.ini": b"[.ShellClassInfo]",
+        "~WRL0001.tmp": b"Word temp file",
+        "Drawing1.dwl": b"AutoCAD lock file",
     }
     for folder, items in ((src, files), (loose, loose_files)):
         for rel, data in items.items():
@@ -528,7 +532,8 @@ class DocumentsEndToEndTests(unittest.TestCase):
         other = documents.split("## Other files\n", 1)[1]
         self.assertIn("Site plan.dwg (", other)
         self.assertIn("Old minutes.doc (", other)
-        for name in ("IMG_0001.jpg", "image001.png", "~$Rates", "desktop.ini"):
+        for name in ("IMG_0001.jpg", "image001.png", "~$Rates", "desktop.ini", "~WRL0001.tmp",
+                     "Drawing1.dwl"):
             self.assertNotIn(name, documents)
         self.assertIn("IMG_0001.jpg", emails)          # photos stay in the email digest
         stats = result["stats"]
@@ -540,6 +545,9 @@ class DocumentsEndToEndTests(unittest.TestCase):
         first = self.run_it()
         before = self.texts()
         found_before, _files = engine.load_docs_cache(engine.docs_cache_path(self.project))
+        with gzip.open(str(engine.docs_cache_path(self.project)), "rt", encoding="utf-8") as fh:
+            saved = json.load(fh)["docs"]
+        self.assertEqual(sorted(saved), sorted(found_before))   # every real DocText has the right shape
         spy = mock.Mock(wraps=docs.extract)
         with mock.patch.object(engine.docs, "extract", spy):
             again = self.run_it()
@@ -618,6 +626,19 @@ class DocumentsEndToEndTests(unittest.TestCase):
             cli.main(["run", "--source", self.src, "--out", self.out, "--name", "Docs Job", "--no-docs"])
         self.assertNotIn("Documents:", out.getvalue())
 
+    def test_cli_list_shows_the_documents_settings(self):
+        projects.save_projects([dict(self.project, docs_from_attachments=False)])
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["list"]), 0)
+        self.assertIn("    documents folder: %s\n    attachments: not condensed" % self.loose, out.getvalue())
+        projects.save_projects([dict(self.project, docs_folder="")])
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            cli.main(["list"])
+        self.assertNotIn("documents folder", out.getvalue())
+        self.assertNotIn("attachments:", out.getvalue())
+
     @unittest.skipIf(gui is None, "tkinter is not available")
     def test_window_helpers_read_a_documents_run(self):
         result = self.run_it()
@@ -627,8 +648,9 @@ class DocumentsEndToEndTests(unittest.TestCase):
         loaded = projects.load_projects()[0]["last_run"]
         self.assertEqual(gui.summary_text(loaded), gui.summary_text(result))
         self.assertIn("4 emails → 4 used in 4 threads, 1 emails file, ~", gui.summary_text(result))
-        self.assertRegex(gui.summary_text(result), r"5 documents condensed \(incl\. 1 drawing\) into 1 "
-                                                   r"documents file, ~\d+ tokens, plus 2 other files listed\.")
+        self.assertRegex(gui.summary_text(result), r"5 documents \(incl\. 1 drawing\) in 1 "
+                                                   r"documents file, ~\d+ tokens, plus 2 other files "
+                                                   r"listed\.")
         self.assertEqual([gui.short_file_name(f["path"]) for f in result["files"]],
                          ["2025-03-04 to 2025-04-12.txt", "documents - 2025-03-04 to 2025-04-12.txt"])
         self.assertEqual([gui.file_kind(f) for f in loaded["files"]], ["emails", "documents"])

@@ -767,6 +767,22 @@ class TeamsChatTests(unittest.TestCase):
         self.assertEqual(c.teams_chat_messages(two), [("Jo", "Pour is at 6am."), ("Sam", "Pump arrives 5:30.")])
 
 
+class FactPiecesTests(unittest.TestCase):
+    def test_sentence_numbers(self):
+        text = ("Pad footings founded in the stiff natural clay below the fill may be designed for an allowable "
+                "bearing pressure of 150 kPa, provided the bases are clean and dry, and the excavations are "
+                "inspected by the geotechnical engineer before 12 May. The site is level.")
+        plain = c.fact_pieces(text, 60)
+        spans, numbers = c.fact_pieces(text, 60, sentences=True)
+        self.assertEqual(spans, plain)
+        self.assertEqual(len(numbers), len(spans))
+        self.assertGreater(len(spans), 2)                   # the long sentence was cut at its clauses
+        self.assertEqual(numbers[0], numbers[1])            # ... so its clauses share a number
+        self.assertNotEqual(numbers[-1], numbers[0])        # 'The site is level.' is another sentence
+        self.assertEqual(c.fact_pieces("", 60, sentences=True), ([], []))
+        self.assertEqual(c.fact_pieces("", 60), [])
+
+
 class CapFactTests(unittest.TestCase):
     FILLER = ("We had a good meeting with the team on site. The weather held up for most of the day. "
               "Everyone was briefed on the plan. The site is tidy and access is good. ")

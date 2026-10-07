@@ -13,7 +13,7 @@ from squish_app import pdftext
 from tests import pdf_builder as pb
 from tests.pdf_builder import A1_LANDSCAPE, A3, A4, Name, PdfWriter, Raw, Ref, Stream
 
-RESULT_KEYS = {"pages", "page_sizes", "page_count", "title", "status", "note"}
+RESULT_KEYS = {"pages", "page_sizes", "page_count", "title", "status", "note", "pages_read", "stopped"}
 
 
 def extract(data, **kwargs):
@@ -113,8 +113,16 @@ class LayoutTests(unittest.TestCase):
         content = (b"BT /F1 10 Tf 12 TL 72 700 Td (The reinforce-) Tj T* (ment was checked. MS-) Tj T*"
                    b" (Word ends) Tj T* (well-) Tj T* (Known) Tj 0 -40 Td (New paragraph) Tj ET")
         result = extract(one_page(content))
+        # A hyphen at a line end is kept (Word does not hyphenate by itself:
+        # "self-weight"); the next word joins it.
         self.assertEqual(result["pages"][0],
-                         "The reinforcement\nwas checked. MS-\nWord ends\nwell-\nKnown\n\nNew paragraph")
+                         "The reinforce-ment\nwas checked. MS-\nWord ends\nwell-\nKnown\n\nNew paragraph")
+
+    def test_soft_hyphen_at_line_end_is_removed(self):
+        # WinAnsi byte 0xAD is a soft hyphen (U+00AD): the word is joined without it.
+        content = b"BT /F1 10 Tf 12 TL 72 700 Td (The reinforce\\255) Tj T* (ment was checked.) Tj ET"
+        result = extract(one_page(content))
+        self.assertEqual(result["pages"][0], "The reinforcement\nwas checked.")
 
     def test_rotated_text_and_late_glyph(self):
         # "Rotated label" is 58.9 pt long at 10 pt. The micro sign is drawn
@@ -269,6 +277,26 @@ class FontTests(unittest.TestCase):
         self.assertEqual(result["pages"][0].split("\n"),
                          ["it’s fine", "α ± ≥ μ", "café", "✔"])
 
+    def test_wingdings2_tick_boxes(self):
+        # Word's PDFs use Wingdings 2 for form tick boxes: R = ☑, 0xA3 = ☐, T = ☒.
+        for to_unicode in (False, True):
+            def fonts(w):
+                font = {"Type": Name("Font"), "Subtype": Name("TrueType"), "BaseFont": Name("ABCDEF+Wingdings2"),
+                        "FontDescriptor": w.add({"Type": Name("FontDescriptor"), "FontName": Name("ABCDEF+Wingdings2"),
+                                                 "Flags": 4})}
+                if to_unicode:      # as Word writes it: codes mapped to private-use characters
+                    font["ToUnicode"] = w.add(Stream(b"1 begincodespacerange <00> <FF> endcodespacerange "
+                                                     b"1 beginbfrange <20> <FF> <F020> endbfrange"))
+                return {"F1": w.add(pb.standard_font("Helvetica")), "F2": w.add(font)}
+            content = (b"BT /F1 12 Tf 72 700 Td (Released:) Tj ET BT /F2 12 Tf 150 700 Td (R) Tj ET "
+                       b"BT /F1 12 Tf 165 700 Td (Yes) Tj ET BT /F2 12 Tf 200 700 Td (\\243) Tj ET "
+                       b"BT /F1 12 Tf 215 700 Td (No) Tj ET BT /F2 12 Tf 250 700 Td (T) Tj ET")
+            result = extract(one_page(content, fonts=fonts))
+            self.assertEqual(" ".join(result["pages"][0].split()), "Released: ☑ Yes ☐ No ☒", to_unicode)
+        self.assertEqual(pdftext.symbol_font_kind("Wingdings 2"), "wingdings2")
+        self.assertEqual(pdftext.symbol_font_kind("Wingdings-Regular"), "wingdings")
+        self.assertEqual(pdftext.symbol_pua_table("symbol")[0xF06E], "\u03bd")      # ν
+
     def test_type3_font(self):
         def fonts(w):
             glyph = w.add(Stream(b"600 0 0 0 500 700 d1 0 0 500 700 re f"))
@@ -399,6 +427,172 @@ class StructureTests(unittest.TestCase):
         page = pb.page_dict(w, b"BT /F1 12 Tf 72 604 Td (Lot:) Tj ET", {"F1": font}, extra={"Annots": annots})
         result = extract(w.build(w.add(pb.catalog(w, [page]))))
         self.assertEqual(result["pages"], ["Lot:  Lot 14 footing F3"])
+
+
+    def test_form_field_value_without_appearance(self):
+        # /NeedAppearances: the value is only in /V (here on the parent field), never drawn.
+        w = PdfWriter()
+        font = w.add(pb.standard_font("Helvetica"))
+        parent = w.add({"FT": Name("Tx"), "T": b"comments", "V": b"UPDATED: HP3 released 13/06/2025\rsubject to NCR-017"})
+        secret = w.add({"FT": Name("Tx"), "Ff": 1 << 13, "V": b"hunter2"})
+        annots = [w.add({"Type": Name("Annot"), "Subtype": Name("Widget"), "Rect": [150, 580, 450, 618],
+                         "Parent": parent}),
+                  w.add({"Type": Name("Annot"), "Subtype": Name("Widget"), "Rect": [150, 500, 450, 518],
+                         "Parent": secret})]
+        content = b"BT /F1 12 Tf 72 604 Td (Comments:) Tj ET BT /F1 12 Tf 72 504 Td (Password:) Tj ET"
+        page = pb.page_dict(w, content, {"F1": font}, extra={"Annots": annots})
+        result = extract(w.build(w.add(pb.catalog(w, [page]))))
+        lines = [" ".join(line.split()) for line in result["pages"][0].split("\n") if line]
+        # The value's first line joins its label; annotations come after the page's own text.
+        self.assertEqual(lines, ["Comments: UPDATED: HP3 released 13/06/2025", "Password:", "subject to NCR-017"])
+
+
+class ReviewMarkupTests(unittest.TestCase):
+    """Stamps, notes, clouds and highlights added in Bluebeam or Acrobat review."""
+
+    def test_review_markups_become_comments(self):
+        result = extract(pb.markup_pdf())
+        lines = [line for line in result["pages"][0].split("\n") if line]
+        self.assertEqual(lines[:2], ["Shop drawing SD-104 Rev 0", "Base plate BP1 25 mm thick, 4 x M24 bolts."])
+        self.assertIn("REVISE AND RESUBMIT", lines)              # the stamp, as it is drawn
+        comments = [line for line in lines if line.startswith("[comment: ")]
+        self.assertEqual(comments, pb.MARKUP_COMMENTS)
+        # Each comment is its own block, after the page's own text.
+        self.assertIn("\n\n[comment: Anchor bolt", result["pages"][0])
+        self.assertEqual(result["note"], "")
+
+    def test_comments_already_on_the_page_are_not_repeated(self):
+        page = "Footing F3 to be 900 deep\nOK to proceed"
+        self.assertEqual(pdftext._with_comments(page, ["footing F3 to be 900 DEEP", "OK", "ok"]), page)
+        self.assertEqual(pdftext._with_comments(page, ["No"]), page + "\n\n[comment: No]")
+        self.assertEqual(pdftext._with_comments("Booked", ["ok"]), "Booked\n\n[comment: ok]")
+        self.assertEqual(pdftext._with_comments("", ["Check"]), "[comment: Check]")
+
+
+class SizeCapTests(unittest.TestCase):
+    """Page content bigger than a cap is never read silently as 'no text'."""
+
+    HEAVY = b"1 2 m 3 4 l S\n" * 5000 + b"BT /F1 10 Tf 72 72 Td (TITLE BLOCK) Tj ET"
+
+    def form_pdf(self):
+        def xobjects(w):
+            font = w.add(pb.standard_font("Helvetica"))
+            return {"Fm1": w.add(Stream(self.HEAVY, {"Type": Name("XObject"), "Subtype": Name("Form"),
+                                                     "BBox": [0, 0, 600, 800],
+                                                     "Resources": {"Font": {"F1": font}}},
+                                        filters=["FlateDecode"]))}
+        return one_page(b"/Fm1 Do", xobjects=xobjects)
+
+    def test_content_streams_are_read_up_to_the_document_budget(self):
+        self.assertGreaterEqual(pdftext.MAX_CONTENT_BYTES, pdftext.MAX_TOTAL_DECODED)
+        for data in (one_page(self.HEAVY), self.form_pdf()):
+            result = extract(data)
+            self.assertEqual((result["pages"], result["note"]), (["TITLE BLOCK"], ""))
+            with mock.patch.object(pdftext, "MAX_CONTENT_BYTES", 1000):
+                capped = extract(data)
+            self.assertEqual(capped["pages"], [""])
+            self.assertIn("incomplete", capped["note"])
+
+    def test_character_map_ranges_are_bounded_in_time(self):
+        # One 'endbfrange' with 333 full ranges asks for 22 million entries.
+        ranges = b"333 beginbfrange\n" + b"<0000> <FFFF> <0041>\n" * 333 + b"endbfrange\n"
+        cmap = b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n" + ranges
+        for count in (1, 20):
+            w = PdfWriter()
+            fonts = {}
+            content = []
+            for n in range(count):
+                font = pb.standard_font("Helvetica")
+                font["ToUnicode"] = w.add(Stream(cmap, filters=["FlateDecode"]))
+                fonts["F%d" % n] = w.add(font)
+                content.append(b"BT /F%d 10 Tf 72 %d Td (A) Tj ET" % (n, 800 - 20 * n))
+            page = pb.page_dict(w, b"\n".join(content), fonts)
+            start = time.monotonic()
+            result = extract(w.build(w.add(pb.catalog(w, [page]))), time_budget=2)
+            self.assertLess(time.monotonic() - start, 6, count)
+            if count == 20:
+                self.assertEqual(result["stopped"], "time")
+
+    def test_truetype_character_map_work_is_capped(self):
+        segs = 30000
+        ends = struct.pack(">%dH" % segs, *([0xFFFE] * segs))
+        starts = struct.pack(">%dH" % segs, *([0x20] * segs))
+        deltas = struct.pack(">%dh" % segs, *([1] * segs))
+        body = struct.pack(">HHHH", 2 * segs, 0, 0, 0) + ends + b"\x00\x00" + starts + deltas + bytes(2 * segs)
+        fmt4 = struct.pack(">HHH", 4, 0, 0) + body
+        groups = 100000
+        fmt12 = struct.pack(">HHIII", 12, 0, 16 + 12 * groups, 0, groups) + \
+            struct.pack(">III", 0x20, 0x10020, 1) * groups
+        for table in (fmt4, fmt12):
+            start = time.monotonic()
+            mapping = pdftext._cmap_subtable(table, 0)
+            self.assertLess(time.monotonic() - start, 1.5)
+            self.assertEqual(mapping[0x41], 0x42 if table is fmt4 else 0x22)
+
+
+class EncryptionTests(unittest.TestCase):
+    """Locked PDFs: an owner password only (they open without a password) are read."""
+
+    def test_known_answers(self):
+        self.assertEqual(pdftext._rc4(b"Key", b"Plaintext").hex(), "bbf316e8d940af0ad3")
+        plain = bytes.fromhex("00112233445566778899aabbccddeeff")
+        for key, cipher in (("000102030405060708090a0b0c0d0e0f", "69c4e0d86a7b0430d8cdb78070b4c55a"),
+                            ("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                             "8ea2b7ca516745bfeafc49904b496089")):      # FIPS-197 C.1 and C.3
+            key = bytes.fromhex(key)
+            self.assertEqual(pdftext._aes_cbc_encrypt(key, bytes(16), plain).hex(), cipher)
+            self.assertEqual(pdftext._aes_cbc_decrypt(key, bytes.fromhex(cipher), iv=bytes(16), unpad=False), plain)
+
+    def test_keys_from_another_implementation(self):
+        # /O /U /ID and an encrypted Info string from PDFs written by pypdf.
+        rc4 = pdftext._Security({
+            "Filter": "Standard", "V": 2, "R": 3, "Length": 128, "P": 0,
+            "O": bytes.fromhex("3579de908f71f3958370af350f7239155038530b5b7210c88b7b416d9572485a"),
+            "U": bytes.fromhex("0ca5821dc5412538d6bd25f24b4d420328bf4e5e4e758a4164004e56fffa0108")},
+            bytes.fromhex("6637376662326633373638653531376665346236363835363939343735393436"), lambda v: v)
+        self.assertEqual(rc4.decrypt(1, 0, bytes.fromhex("8920c0095a487eab49a8ad30befc3a0d135de30b3e171a"), "rc4"),
+                         b"Owner only test RC4-128")
+        aes = pdftext._Security({
+            "Filter": "Standard", "V": 5, "R": 6, "P": 0, "StmF": "StdCF", "StrF": "StdCF",
+            "CF": {"StdCF": {"CFM": "AESV3", "Length": 32}},
+            "O": bytes.fromhex("55d40d01262685581cb293dd96bcf7d1f00db02bb3ac3ddfc70655607daf7bd9"
+                               "66fcfedd23a0d78be482a428f5dbd31f"),
+            "U": bytes.fromhex("8b5239a451f3b20012b1f32927e1842e9276d222f686143f4900bebfae44542f"
+                               "732703fa83e2d703693237fbbdc84e7b"),
+            "UE": bytes.fromhex("14be44c971de3583e43c5ee48df7dd852f76dfd5fe036bf9369062a656f7c9ea")},
+            b"", lambda v: v)
+        self.assertEqual(aes.decrypt(1, 0, bytes.fromhex(
+            "cae90f191b950c48595bf4d7fbb88d14fe36270b5760e5f22b13cf96ed926b67"
+            "fef2019b3b802bd2b6a47da028fea564"), aes.string_method), b"Owner only test AES-256")
+
+    def test_owner_password_only_files_are_read(self):
+        cases = [("rc4-40", {}), ("rc4-128", {}), ("rc4-128", {"object_streams": True}),
+                 ("rc4-128-v4", {}), ("aes-128", {}), ("aes-128", {"object_streams": True}),
+                 ("aes-128", {"encrypt_metadata": False}), ("aes-256-r5", {}), ("aes-256", {})]
+        for kind, options in cases:
+            data = pb.simple_pdf(["Locked report (page 1): 43.5 MPa", "Second page"], title="Café – certificates",
+                                 encrypt=kind, **options)
+            result = extract(data)
+            self.assertEqual(result["status"], "ok", (kind, options))
+            self.assertEqual(result["pages"], ["Locked report (page 1): 43.5 MPa", "Second page"], (kind, options))
+            self.assertEqual(result["title"], "Café – certificates", (kind, options))
+
+    def test_files_that_need_a_password_stay_protected(self):
+        for kind in ("rc4-128", "aes-128", "aes-256-r5"):
+            result = extract(pb.simple_pdf(["Secret text"] * 2, encrypt=kind, user_password=b"letmein"))
+            self.assertEqual(result["status"], "protected", kind)
+            self.assertEqual(result["pages"], [], kind)
+            self.assertEqual(result["page_count"], 2, kind)
+            self.assertIn("password needed to open it", result["note"], kind)
+
+    def test_other_locks_are_unsupported(self):
+        w = PdfWriter()
+        page = pb.page_dict(w, pb.text_content(["Certificate security"]), {"F1": w.add(pb.standard_font())})
+        data = w.build(w.add(pb.catalog(w, [page])), trailer_extra={
+            "Encrypt": w.add({"Filter": Name("Adobe.PubSec"), "V": 4, "R": 4})})
+        result = extract(data)
+        self.assertEqual(result["status"], "protected")
+        self.assertIn("security Squish cannot read", result["note"])
 
 
 class FilterTests(unittest.TestCase):
@@ -535,6 +729,31 @@ class DamagedFileTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertIn("Stopped after 0 seconds", result["note"])
         self.assertEqual(result["pages"], ["Start"])
+        self.assertEqual((result["pages_read"], result["stopped"]), (1, "time"))
+
+    def test_pages_not_reached_are_counted(self):
+        # Page 1 is slow: the time budget runs out on it; pages 2-3 are never reached.
+        slow = pb.text_content(["Page one"]) + b"q Q " * 300000
+        w = PdfWriter()
+        font = w.add(pb.standard_font("Helvetica"))
+        pages = [pb.page_dict(w, slow, {"F1": font})] + [
+            pb.page_dict(w, pb.text_content(["Page %d" % n]), {"F1": font}) for n in (2, 3)]
+        result = extract(w.build(w.add(pb.catalog(w, pages))), time_budget=0)
+        self.assertEqual(result["pages"], ["Page one", "", ""])
+        self.assertEqual((result["pages_read"], result["stopped"]), (1, "time"))
+        self.assertIn("pages from 2 on were not read", result["note"])
+        whole = extract(pb.simple_pdf(["a", "b"]))
+        self.assertEqual((whole["pages_read"], whole["stopped"]), (2, ""))
+
+    def test_stop_function_stops_between_pages(self):
+        asked = []
+
+        def stop():
+            asked.append(1)
+            return len(asked) > 2
+        result = extract(pb.simple_pdf(["One", "Two", "Three", "Four"]), stop=stop)
+        self.assertEqual(result["pages"], ["One", "Two", "", ""])
+        self.assertEqual((result["pages_read"], result["stopped"]), (2, "cancelled"))
 
     def test_operator_cap_keeps_partial_page(self):
         content = b"BT /F1 12 Tf 72 700 Td (Start) Tj ET\n" + b"q Q " * 50000 + b"BT /F1 12 Tf 72 600 Td (Never) Tj ET"

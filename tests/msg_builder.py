@@ -238,9 +238,12 @@ def message_tree(subject="", body=None, html=None, rtf_compressed=None,
 
     recipients: [(name, smtp, email_address, type)] (type 1 To, 2 Cc, 3 Bcc)
     attachments: [{"long_name", "short_name", "display_name", "data", "content_id",
-                   "mime", "hidden", "flags", "size", "embedded": message_tree(...)}]
+                   "mime", "hidden", "flags", "size", "method", "embedded": message_tree(...)}]
                  "data" is the attachment's bytes, written as its data stream
-                 (__substg1.0_37010102; 4096 bytes or more go in regular sectors);
+                 (__substg1.0_37010102; 4096 bytes or more go in regular sectors;
+                 None writes no data stream, as for a cloud attachment);
+                 "method" is PR_ATTACH_METHOD (default 1, or 5 for "embedded"; 7 is
+                 an Outlook cloud attachment, a link to a shared file);
                  "size" is PR_ATTACH_SIZE (left out unless given). file_attachment()
                  makes one the way Outlook does. An "embedded" message may have
                  attachments of its own.
@@ -321,7 +324,8 @@ def message_tree(subject="", body=None, html=None, rtf_compressed=None,
         if a.get("flags") is not None:
             at.long(0x3714, a["flags"])
         inner = a.get("embedded")
-        at.long(0x3705, 5 if inner is not None else 1)
+        method = a.get("method")
+        at.long(0x3705, method if method is not None else (5 if inner is not None else 1))
         if a.get("size") is not None:
             at.long(0x0E20, a["size"])
         if inner is None:

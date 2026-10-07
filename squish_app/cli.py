@@ -132,6 +132,10 @@ def cmd_list():
         when = last.get("finished_at") if isinstance(last, dict) else ""
         _print("%s" % (p.get("name") or "(unnamed)"))
         _print("    emails: %s" % (p.get("source_folder") or "(no folder chosen)"))
+        if p.get("docs_folder"):
+            _print("    documents folder: %s" % p["docs_folder"])
+        if p.get("docs_from_attachments") is False:
+            _print("    attachments: not condensed")
         if when:
             _print("    last run: %s" % when)
     return 0
@@ -287,6 +291,9 @@ def _documents_lines(result):
     unread = len(problems) - len(folders)
     if unread:
         lines.append("%s could not be read (see the run log)" % _plural(unread, "document"))
+    if result.get("doc_digest_failed"):
+        lines.append("The documents digest could not be made (see the run log); any earlier "
+                     "documents file was kept.")
     return lines
 
 

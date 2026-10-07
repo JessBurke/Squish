@@ -1205,6 +1205,28 @@ class DocumentAttachmentTests(TempDirMixin, unittest.TestCase):
         for att in rec["attachments"]:
             self.assertNotIn("data", att)
 
+    def test_cloud_attachment_is_marked_as_a_link(self):
+        # An Outlook cloud attachment (PR_ATTACH_METHOD 7) or one by reference
+        # (2) is a link to a shared file: a name, no data stream.
+        data = msg_with_documents(attachments=[
+            {"long_name": "Geotech Report Rev C.pdf", "data": None, "method": 7, "size": 300},
+            {"long_name": "Shared plan.dwg", "data": None, "method": 2},
+            mb.file_attachment("Calc.xlsx", CALC)])
+        path = self.write("cloud.msg", data)
+        readings = [self.read_builtin(path, want_docs=True), self.read_builtin(path)]
+        if extract_msg_installed():
+            with mock.patch.dict(os.environ, {"SQUISH_NO_EXTRACT_MSG": ""}):
+                readers._extract_msg_state["checked"] = False
+                readings.append(readers.read_email(path, want_docs=True))
+            self.assertEqual(readings[-1]["reader"], "extract_msg")
+        for rec in readings:
+            atts = dict((a["name"], a) for a in rec["attachments"])
+            self.assertIs(atts["Geotech Report Rev C.pdf"].get("link"), True, rec["reader"])
+            self.assertIs(atts["Shared plan.dwg"].get("link"), True, rec["reader"])
+            self.assertNotIn("sha1", atts["Geotech Report Rev C.pdf"])
+            self.assertNotIn("link", atts["Calc.xlsx"])      # an ordinary attachment: no key
+        self.assertEqual(readings[0]["attachments"][2]["_data"], CALC)
+
 
 class SurrogateTests(unittest.TestCase):
 

@@ -1058,11 +1058,16 @@ class _RtfGroup(object):
         return other
 
 
-def rtf_to_html_or_text(rtf, codepage=None):
+def rtf_to_html_or_text(rtf, codepage=None, symbol_char=None):
     """Turn decompressed RTF into ("html", text) if it wraps HTML, else ("text", text).
 
     Best effort: enough to recover readable text from emails that have no
     other body. Formatting is dropped.
+
+    ``symbol_char`` (optional, used for .rtf documents) is a function
+    (font name, code) -> text or None: text in a font for which it gives a
+    result (Symbol, Wingdings) is mapped by it instead of being decoded with
+    the code page, so "\\f2\\'b3" in Symbol reads as the sign it shows.
     """
     if isinstance(rtf, str):
         rtf = rtf.encode("latin-1", "replace")
@@ -1075,6 +1080,8 @@ def rtf_to_html_or_text(rtf, codepage=None):
     pending = bytearray()   # 8-bit text waiting to be decoded
     font_codecs = {}        # font number -> codec, from the font table
     table_font = [None]     # font being defined in the font table
+    table_depth = [None]    # group depth of that font's entry (its name is text there)
+    font_names = {}         # font number -> name, from the font table (only with symbol_char)
     state = _RtfGroup()
     stack = []
     skip_chars = 0          # fallback characters to skip after \uN
@@ -1088,10 +1095,22 @@ def rtf_to_html_or_text(rtf, codepage=None):
             return True
         return not (html_mode and state.htmlrtf)
 
+    def symbol_font():
+        """The current font's name when symbol_char maps its characters, else None."""
+        name = font_names.get(state.font)
+        if symbol_char is None or not name:
+            return None
+        name = name.split(";")[0].strip()
+        return name if symbol_char(name, 0x20) is not None else None
+
     def flush():
         if pending:
-            codec = font_codecs.get(state.font, default_codec)
-            out.append(pending.decode(codec, "replace"))
+            name = symbol_font()
+            if name is not None:
+                out.append("".join(symbol_char(name, b) or "" for b in pending))
+            else:
+                codec = font_codecs.get(state.font, default_codec)
+                out.append(pending.decode(codec, "replace"))
             del pending[:]
 
     for m in _RTF_TOKEN.finditer(rtf):
@@ -1123,6 +1142,7 @@ def rtf_to_html_or_text(rtf, codepage=None):
                 # Font table entries look like {\f1\fnil\fcharset134 SimSun;}
                 if word == "f" and num is not None:
                     table_font[0] = int(num)
+                    table_depth[0] = len(stack)
                 elif word == "fcharset" and num is not None and table_font[0] is not None:
                     cp = _RTF_CHARSET_CODEPAGES.get(int(num))
                     if cp:
@@ -1161,8 +1181,10 @@ def rtf_to_html_or_text(rtf, codepage=None):
                 if code < 0:
                     code += 65536
                 if visible():
+                    # Word writes a Symbol character as \u-3917 (U+F0B3): its font maps it.
+                    name = symbol_font() if 0xF020 <= code <= 0xF0FF else None
                     try:
-                        out.append(chr(code))
+                        out.append((symbol_char(name, code) or "") if name else chr(code))
                     except (ValueError, OverflowError):
                         pass  # damaged RTF: a character number that doesn't exist
                 skip_chars = state.uc
@@ -1207,6 +1229,9 @@ def rtf_to_html_or_text(rtf, codepage=None):
                 out.append("\n")
             continue
         if text is not None:
+            if state.fonttbl and symbol_char is not None and table_font[0] is not None \
+                    and table_depth[0] == len(stack):
+                font_names[table_font[0]] = (font_names.get(table_font[0], "") + text.decode("latin-1"))[:200]
             if skip_chars:
                 n = min(skip_chars, len(text))
                 text = text[n:]

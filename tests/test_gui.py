@@ -302,14 +302,28 @@ class DocumentHelperTests(TempDataDir):
             "Sub/Drainage report.pdf", "Sub/Sketch.png",
             "Digests/Squish - Job - documents - undated.txt", "Digests/Kept.pdf"])
         stop = threading.Event()
-        self.assertEqual(gui.count_document_files(folder, True, stop, lambda n: None), (10, 4))
-        self.assertEqual(gui.count_document_files(folder, False, stop, lambda n: None), (8, 3))
+        self.assertEqual(gui.count_document_files(folder, True, stop, lambda n: None), (10, 4, 0))
+        self.assertEqual(gui.count_document_files(folder, False, stop, lambda n: None), (8, 3, 0))
         # The output folder (and everything in it) is left out, as in a run.
         out = os.path.join(folder, "Digests")
         self.assertEqual(gui.count_document_files(folder, True, stop, lambda n: None,
-                                                  skip_folder=out), (9, 4))
+                                                  skip_folder=out), (9, 4, 0))
+        # A folder of emails only (e.g. the emails folder itself): its email files are counted.
+        emails = tempfile.mkdtemp(dir=self.data_dir)
+        self.make_files(emails, ["a.msg", "b.eml", "Sub/c.msg", "~$d.msg"])
+        self.assertEqual(gui.count_document_files(emails, True, stop, lambda n: None), (0, 0, 3))
+        self.assertEqual(gui.count_document_files(emails, False, stop, lambda n: None), (0, 0, 2))
+        # With the Emails tab's folder: only the emails the email scan reads are left
+        # out; saved emails elsewhere are other files (listed, as in a run).
+        self.assertEqual(gui.count_document_files(folder, True, stop, lambda n: None,
+                                                  email_folder=emails), (10, 6, 0))
+        self.assertEqual(gui.count_document_files(emails, True, stop, lambda n: None,
+                                                  email_folder=emails), (0, 0, 3))
+        self.assertEqual(gui.count_document_files(emails, True, stop, lambda n: None, email_folder=emails,
+                                                  email_subfolders=False), (0, 1, 0))
         stop.set()
         self.assertIsNone(gui.count_document_files(folder, True, stop, lambda n: None))
+        self.assertIsNone(gui.count_document_files(emails, True, stop, lambda n: None))
 
     def test_count_documents_reports_folders_it_cannot_open(self):
         folder = tempfile.mkdtemp(dir=self.data_dir)
@@ -328,7 +342,7 @@ class DocumentHelperTests(TempDataDir):
         with mock.patch("os.scandir", side_effect=scandir):
             counts = gui.count_document_files(folder, True, threading.Event(), lambda n: None,
                                               skipped)
-        self.assertEqual(counts, (1, 0))
+        self.assertEqual(counts, (1, 0, 0))
         self.assertEqual([os.path.basename(p) for p in skipped], ["Locked"])
 
         def scandir_top(path="."):
@@ -354,7 +368,7 @@ class DocumentHelperTests(TempDataDir):
     def test_docs_count_text(self):
         text, style = gui.docs_count_text(64, 31, 0, True)
         self.assertEqual(text, "64 documents found (incl. subfolders) - plus 31 other files, "
-                               "listed by name only.")
+                               "listed, not read.")
         self.assertEqual(style, "Good")
         text, style = gui.docs_count_text(1, 0, 2, False)
         self.assertEqual(text, "1 document found (this folder only) (2 subfolders couldn't be "
@@ -363,22 +377,46 @@ class DocumentHelperTests(TempDataDir):
         text, style = gui.docs_count_text(0, 3, 0, False)
         self.assertIn("No Word, Excel, PowerPoint, PDF or text files here - just 3 other files",
                       text)
+        # Other files alone make no documents file, so don't promise to list them.
+        self.assertIn("which Squish can't read, so this folder alone won't make a documents "
+                      "file.", text)
+        self.assertNotIn("will be listed", text)
         self.assertIn("Tick 'Include subfolders'", text)
         self.assertEqual(style, "Warn")
         self.assertEqual(gui.docs_count_text(0, 0, 0, True), ("No files here.", "Warn"))
         text, style = gui.docs_count_text(gui.MANY_DOCUMENTS + 1, 0, 0, True)
         self.assertIn("takes a while", text)
         self.assertEqual(style, "Warn")
+        # A folder of emails only (allowed: e.g. the emails folder) is not called empty.
+        text, style = gui.docs_count_text(0, 0, 0, True, emails=5)
+        self.assertEqual(text, "Only emails here (5 email files - Squish reads emails from the "
+                               "Emails tab's folder), no other documents found.")
+        self.assertEqual(style, "Hint")
+        text, style = gui.docs_count_text(0, 0, 1, False, emails=1)
+        self.assertIn("Only emails here (1 email file", text)
+        self.assertIn("(1 subfolder couldn't be opened)", text)
+        self.assertIn("Tick 'Include subfolders'", text)
+        self.assertEqual(style, "Warn")
+        self.assertIn("64 documents found", gui.docs_count_text(64, 0, 0, True, emails=5)[0])
+
+    def test_blank_documents_folder_hint_follows_the_attachments_box(self):
+        self.assertIn("Leave blank to condense only the attachments.",
+                      gui.docs_folder_blank_hint(True))
+        self.assertIn("Leave blank for no documents folder.", gui.docs_folder_blank_hint(False))
+        self.assertNotIn("attachments", gui.docs_folder_blank_hint(False))
 
     def test_docs_folder_that_is_the_output_folder(self):
         out = os.path.join(self.data_dir, "Out")
         self.assertTrue(gui.docs_folder_problem(out, out))
-        self.assertTrue(gui.docs_folder_problem(os.path.join(out, "Sub"), out))
+        self.assertTrue(gui.docs_folder_problem(out + os.sep, out))
+        # A folder inside the output folder is fine (the run skips only the output folder).
+        self.assertEqual(gui.docs_folder_problem(os.path.join(out, "Sub"), out), "")
         self.assertEqual(gui.docs_folder_problem(os.path.join(self.data_dir, "Reports"), out), "")
         self.assertEqual(gui.docs_folder_problem("", out), "")
 
     def test_pdf_reader_text(self):
-        self.assertEqual(gui.pdf_reader_text("PDF: pypdf 5.1.0"), ("pypdf 5.1.0", "Hint"))
+        self.assertEqual(gui.pdf_reader_text("PDF: pypdf 5.1.0"),
+                         ("Installed (pypdf 5.1.0) - PDFs are read with the better reader.", "Hint"))
         text, style = gui.pdf_reader_text("PDF: built-in reader (install pypdf for best results)")
         self.assertEqual((text, style), (gui.PDF_ADVICE, "Hint"))
         self.assertTrue(text.startswith("PDFs are read with Squish's built-in reader. For better "
@@ -404,19 +442,29 @@ class DocumentHelperTests(TempDataDir):
         files = [self.EMAILS, self.DOCS]                    # 100k tokens: one chat
         tip = gui.results_tip(files, True)
         self.assertTrue(tip.startswith("Drag in the emails file first; add the documents file "
-                                       "when you need what the attachments say."))
+                                       "when you need what the documents say."))
         self.assertIn("small enough for one Claude chat", tip)
+        self.assertNotIn("same chat", tip)
         done = gui.done_message(5, files, True)
         self.assertIn("2 files ready - they fit in one Claude chat", done)
         self.assertIn("the emails file first; add the documents file when you need what the "
-                      "attachments say", done)
+                      "documents say", done)
         big = [dict(self.EMAILS, est_tokens=130000), self.DOCS]
         tip = gui.results_tip(big, False)
         self.assertIn("new Claude chat for each file", tip)
-        self.assertIn("Begin with the emails file; use the documents file", tip)
+        self.assertIn("Begin with the emails file; use the documents file when you need what the "
+                      "documents say.", tip)
         self.assertNotIn("Copy file", tip)
-        self.assertIn("use a new Claude chat for each file, starting with the emails file",
-                      gui.done_message(5, big, True))
+        # Separate chats lose the link between the emails and their attachments: say so,
+        # and how to get a pair that fits one chat.
+        self.assertIn("Claude links emails to their attachments (the =D12 marks) only when both "
+                      "files are in the same chat - for that, narrow the run with dates or Focus "
+                      "keywords.", tip)
+        done = gui.done_message(5, big, True)
+        self.assertIn("use a new Claude chat for each file, starting with the emails file", done)
+        self.assertIn("separate chats can't link emails to their attachments", done)
+        self.assertIn("same chat", gui.results_tip([dict(f, est_tokens=1000) for f in files],
+                                                   True, "small"))
         # Several parts of each: plurals, and a Small run is never one chat.
         parts = [self.EMAILS, self.EMAILS, self.DOCS, self.DOCS]
         for part_size in ("small", "medium"):
@@ -430,6 +478,104 @@ class DocumentHelperTests(TempDataDir):
         self.assertTrue(gui.results_tip([self.DOCS, self.DOCS], True).startswith(
             "2 documents files"))
 
+    def test_done_message_warns_when_the_documents_folder_was_not_read(self):
+        missing = {"files": [self.EMAILS, self.DOCS],
+                   "doc_problems": [["H:\\Job\\Reports", "documents folder not found: check the VPN"],
+                                    ["Report.pdf", "password-protected PDF"]]}
+        self.assertEqual(gui.docs_folder_warning(missing),
+                         " The documents folder (or a folder in it) couldn't be opened, so its "
+                         "documents are missing - see run log.")
+        self.assertEqual(gui.docs_folder_warning(projects.last_run_from_result(missing)),
+                         gui.docs_folder_warning(missing))
+        self.assertEqual(gui.docs_folder_warning({"files": [self.EMAILS], "doc_problems": [
+            ["Report.pdf", "password-protected PDF"]]}), "")
+        self.assertEqual(gui.docs_folder_warning({"files": [self.EMAILS]}), "")
+
+    def test_documents_digest_that_could_not_be_made(self):
+        # engine.run_project: the documents digest failed, the emails file was
+        # written and the earlier documents file was kept (it is out of date).
+        result = {"files": [self.EMAILS], "files_found": 5, "doc_digest_failed": True,
+                  "stats": {"emails_used": 5, "threads": 2}, "failed": [], "doc_problems": []}
+        sentence = (" The documents file couldn't be made this time (see run log), so only the "
+                    "emails file was written - any documents file already in the folder is from "
+                    "an earlier run.")
+        self.assertEqual(gui.docs_digest_warning(result), sentence)
+        self.assertTrue(gui.summary_text(result).endswith(sentence))
+        saved = projects.last_run_from_result(result)
+        self.assertEqual(gui.docs_digest_warning(saved), sentence)
+        self.assertEqual(gui.summary_text(saved), gui.summary_text(result))
+        self.assertIn("the emails files were written", gui.docs_digest_warning(
+            dict(result, files=[self.EMAILS, self.EMAILS])))
+        self.assertIn("couldn't be made either", gui.docs_digest_warning(dict(result, files=[])))
+        # A normal run (or a last_run saved before 1.1) says nothing.
+        for ok in ({"files": [self.EMAILS, self.DOCS]}, dict(result, doc_digest_failed=False),
+                   {"files": [self.EMAILS], "stats": {"emails_used": 5}}):
+            self.assertEqual(gui.docs_digest_warning(ok), "")
+            self.assertNotIn("couldn't be made", gui.summary_text(ok))
+        self.assertFalse(projects.last_run_from_result({"files": [self.EMAILS]})[
+            "doc_digest_failed"])
+
+    def test_no_documents_file_says_why(self):
+        def run(found, **extra):
+            stats = {"emails_used": 50, "threads": 5}
+            if found is not None:
+                stats["doc_found"] = found
+            return dict({"files": [self.EMAILS], "files_found": 50, "stats": stats}, **extra)
+
+        # A documents folder of photos, CAD and old .doc files only.
+        self.assertEqual(gui.no_documents_note(run(7)),
+                         "No documents file: none of the 7 files found could be read (see run "
+                         "log).")
+        self.assertIn("none of the 1 file found", gui.no_documents_note(run(1)))
+        self.assertEqual(gui.no_documents_note(run(0)),
+                         "No documents file: no documents were found.")
+        focus = run(0, files=[dict(self.EMAILS, path="Squish - Job - undated (focus pump).txt")])
+        self.assertEqual(gui.no_documents_note(focus),
+                         "No documents file: no documents match the focus keywords.")
+        text = gui.summary_text(run(7))
+        self.assertTrue(text.endswith(" No documents file: none of the 7 files found could be "
+                                      "read (see run log)."), text)
+        self.assertEqual(gui.summary_text(projects.last_run_from_result(run(7))), text)
+        # Unreadable documents among them: one sentence, not two.
+        text = gui.summary_text(run(7, doc_problem_count=2))
+        self.assertNotIn("2 documents couldn't be read", text)
+        self.assertIn("none of the 7 files found could be read", text)
+        # Documents not wanted (no doc_found), a documents file written, or a failed
+        # documents digest (its own sentence): no note.
+        self.assertEqual(gui.no_documents_note(run(None)), "")
+        self.assertNotIn("No documents file", gui.summary_text(run(None)))
+        self.assertEqual(gui.no_documents_note(run(7, files=[self.EMAILS, self.DOCS])), "")
+        self.assertEqual(gui.no_documents_note(run(7, doc_digest_failed=True)), "")
+        self.assertNotIn("No documents file", gui.summary_text(run(7, doc_digest_failed=True)))
+
+    def test_documents_folder_that_was_the_output_folder(self):
+        # engine._scan_documents_folder skips it: it is not "couldn't be opened".
+        result = {"files": [self.EMAILS, self.DOCS], "files_found": 5, "failed": [],
+                  "stats": {"emails_used": 5, "threads": 2, "documents": 3},
+                  "doc_problems": [["C:\\Out", "documents folder not read: it is the output "
+                                                "folder"]]}
+        self.assertTrue(gui.docs_folder_is_output(result))
+        self.assertEqual(gui.docs_folder_warning(result),
+                         " The documents folder is the output folder, so it was skipped - see "
+                         "run log.")
+        text = gui.summary_text(result)
+        self.assertIn("The documents folder is the output folder, so it was skipped (see run "
+                      "log).", text)
+        self.assertNotIn("couldn't be opened", text)
+        # A saved last_run reads the same.
+        saved = projects.last_run_from_result(result)
+        self.assertTrue(saved["doc_folder_is_output"])
+        self.assertTrue(gui.docs_folder_is_output(saved))
+        self.assertEqual(gui.docs_folder_warning(saved), gui.docs_folder_warning(result))
+        self.assertEqual(gui.summary_text(saved), text)
+        # Other documents folder problems keep their wording.
+        missing = dict(result, doc_problems=[["H:\\Reports", "documents folder not found: VPN?"]])
+        self.assertFalse(gui.docs_folder_is_output(missing))
+        self.assertFalse(gui.docs_folder_is_output(projects.last_run_from_result(missing)))
+        self.assertIn("couldn't be opened", gui.docs_folder_warning(missing))
+        self.assertIn("couldn't be opened", gui.summary_text(missing))
+        self.assertFalse(gui.docs_folder_is_output({"files": [self.EMAILS]}))   # before 1.1
+
     def test_summary_mentions_the_documents(self):
         result = {"files": [self.EMAILS, self.DOCS], "files_found": 2345,
                   "stats": {"emails_used": 1876, "threads": 214, "documents": 64,
@@ -440,21 +586,122 @@ class DocumentHelperTests(TempDataDir):
                       ["H:\\Job\\Reports", "documents folder not found: check the VPN"]]}
         text = gui.summary_text(result)
         self.assertIn("2,345 emails → 1,876 used in 214 threads, 1 emails file, ~60k tokens.", text)
-        self.assertIn("73 documents condensed (incl. 9 drawings) into 1 documents file, ~40k tokens, "
-                      "plus 31 other files listed.", text)
-        self.assertIn("3 documents couldn't be read (see run log).", text)
+        # The documents that couldn't be read are among the other files listed: counted there.
+        self.assertIn("73 documents (incl. 9 drawings) in 1 documents file, ~40k tokens, "
+                      "plus 31 other files listed (3 of them couldn't be read - see run "
+                      "log).", text)
+        self.assertNotIn("3 documents couldn't be read", text)
         self.assertIn("The documents folder (or a folder in it) couldn't be opened", text)
         # A saved last_run keeps only the counts, and reads the same.
         self.assertEqual(gui.summary_text(projects.last_run_from_result(result)), text)
         # Drawings count as documents (as in the Contains column); a run without a
         # documents file says nothing about documents.
-        self.assertIn("2 documents condensed (incl. 2 drawings) into 1 documents file, ~40k tokens.",
+        self.assertIn("2 documents (incl. 2 drawings) in 1 documents file, ~40k tokens.",
                       gui.summary_text({"files": [self.EMAILS, self.DOCS], "stats": {"doc_drawings": 2}}))
-        self.assertIn("1 document condensed into 1 documents file, ~40k tokens.", gui.summary_text(
+        self.assertIn("1 document in 1 documents file, ~40k tokens.", gui.summary_text(
             {"files": [self.EMAILS, self.DOCS], "stats": {"documents": 1}}))
+        # Every other file couldn't be read / only one other file / more failures than listed.
+        stats = {"documents": 4, "doc_other": 2}
+        self.assertIn("plus 2 other files listed (none of them could be read - see run "
+                      "log).", gui.summary_text({"files": [self.DOCS], "stats": stats,
+                                                 "doc_problem_count": 2}))
+        self.assertIn("plus 1 other file listed (it couldn't be read - see run log).",
+                      gui.summary_text({"files": [self.DOCS], "doc_problem_count": 1,
+                                        "stats": dict(stats, doc_other=1)}))
+        text = gui.summary_text({"files": [self.DOCS], "stats": stats, "doc_problem_count": 3})
+        self.assertIn("plus 2 other files listed. 3 documents couldn't be read (see run "
+                      "log).", text)
+        # No documents file: the documents that couldn't be read get their own sentence.
+        self.assertIn("2 documents couldn't be read (see run log).", gui.summary_text(
+            {"files": [self.EMAILS], "stats": {"emails_used": 5}, "doc_problem_count": 2}))
         plain = gui.summary_text({"files": [self.EMAILS], "files_found": 5,
                                   "stats": {"emails_used": 5, "threads": 2}})
         self.assertNotIn("document", plain)
+
+    # A run whose focus keywords (or dates) left no emails, but documents to write.
+    DOCS_ONLY = {"files": [{"kind": "documents", "est_tokens": 6000, "documents": 4,
+                            "path": os.path.join("out", "Squish - A - documents - 2025-01-01 to "
+                                                        "2025-01-02 (focus pump).txt")}],
+                 "files_found": 164,
+                 "stats": {"emails_in": 164, "emails_used": 0, "filtered_out": 160,
+                           "documents": 4, "doc_drawings": 18}}
+
+    def test_documents_only_run_summary(self):
+        text = gui.summary_text(self.DOCS_ONLY)
+        self.assertTrue(text.startswith("164 emails read, but none were left to write, so this "
+                                        "run made only a documents file (any earlier emails "
+                                        "files were kept)."), text)
+        self.assertNotIn("check the dates", text)
+        self.assertIn("160 without the focus keywords skipped.", text)
+        self.assertIn("22 documents (incl. 18 drawings) in 1 documents file, ~6k tokens.", text)
+        # Nothing written at all: still the old advice.
+        self.assertIn("check the dates and focus keywords", gui.summary_text(
+            {"files": [], "files_found": 164, "stats": {"emails_used": 0}}))
+
+    def test_documents_only_run_done_message(self):
+        files = self.DOCS_ONLY["files"]
+        done = gui.done_message(1, files, True, filters="only conversations mentioning pump")
+        self.assertIn("only documents mentioning pump", done)
+        self.assertNotIn("conversations", done)
+        done = gui.done_message(1, files, True, filters="only 2025-01-01 to 2025-01-31 and only "
+                                                        "conversations mentioning pump")
+        self.assertTrue(done.endswith("only 2025-01-01 to 2025-01-31 and only documents "
+                                      "mentioning pump."), done)
+        # With an emails file the keywords picked conversations, as before.
+        self.assertIn("only conversations mentioning pump", gui.done_message(
+            1, [self.EMAILS, self.DOCS], True, filters="only conversations mentioning pump"))
+
+    def test_documents_file_with_dates_outside_a_dated_run(self):
+        def docs_file(tag, first, last, kind="documents"):
+            name = ("Squish - Job - %s2024-11-15 to 2025-10-31%s.txt"
+                    % ("documents - " if kind == "documents" else "", tag))
+            return {"path": os.path.join("out", name), "kind": kind, "first_date": first,
+                    "last_date": last, "est_tokens": 1000, "documents": 3}
+
+        tag = " (only 2025-03-01 to 2025-04-30)"
+        note = gui.undated_docs_note([docs_file(tag, "2024-11-15", "2025-10-31")])
+        self.assertEqual(note, " The documents file also has the files in the documents folder, "
+                               "whatever their date (attachments follow the dates).")
+        self.assertEqual(gui.undated_docs_note([docs_file(tag, "2025-03-02", "2025-04-30")]), "")
+        # Only the start, or only the end, of the range matters for a one-sided run.
+        self.assertTrue(gui.undated_docs_note([docs_file(" (only from 2025-03-01)",
+                                                         "2025-01-02", "2025-04-30")]))
+        self.assertEqual(gui.undated_docs_note([docs_file(" (only from 2025-03-01)",
+                                                          "2025-03-02", "2026-04-30")]), "")
+        self.assertTrue(gui.undated_docs_note([docs_file(" (only up to 2025-04-30) (focus pump) "
+                                                         "(part 1 of 2)", "2025-01-02",
+                                                         "2025-05-01")]))
+        # An all-dates run, or an emails file, never gets the note.
+        self.assertEqual(gui.undated_docs_note([docs_file("", "2024-11-15", "2025-10-31")]), "")
+        self.assertEqual(gui.undated_docs_note([docs_file(tag, "2024-11-15", "2025-10-31",
+                                                          "emails")]), "")
+        # Several parts: plural.
+        parts = [docs_file(tag + " (part %d of 2)" % i, "2024-11-15", "2025-10-31")
+                 for i in (1, 2)]
+        self.assertIn("The documents files also have", gui.undated_docs_note(parts))
+        # The summary carries it, after the documents sentence (also for a saved last_run).
+        emails = docs_file(tag, "2025-03-02", "2025-04-30", "emails")
+        result = {"files": [emails, docs_file(tag, "2024-11-15", "2025-10-31")],
+                  "files_found": 60, "stats": {"emails_used": 46, "threads": 20, "documents": 18,
+                                               "outside_dates": 14}}
+        text = gui.summary_text(result)
+        self.assertIn("18 documents in 1 documents file, ~1k tokens. The documents file also has "
+                      "the files in the documents folder, whatever their date", text)
+        self.assertEqual(gui.summary_text(projects.last_run_from_result(result)), text)
+        self.assertNotIn("whatever their date", gui.summary_text(
+            {"files": [emails], "files_found": 60, "stats": {"emails_used": 46}}))
+
+    def test_squeeze_levels_say_what_they_do_to_documents(self):
+        texts = dict((key, text) for key, _label, text in gui.squeeze_options())
+        self.assertIn("Documents kept up to about 30,000 characters each.", texts["light"])
+        self.assertIn("Long documents condensed to about 8,000 characters each.", texts["standard"])
+        self.assertIn("Documents condensed to about 2,500 characters each.", texts["max"])
+        self.assertTrue(texts["standard"].startswith("Long emails trimmed"))
+        # Without the documents code, the email descriptions are still shown.
+        with mock.patch.dict("sys.modules", {"squish_app.docdigest": None}):
+            texts = dict((key, text) for key, _label, text in gui.squeeze_options())
+        self.assertNotIn("characters each", texts["standard"])
+        self.assertTrue(texts["standard"].startswith("Long emails trimmed"))
 
 
 @unittest.skipIf(not has_display(), "no display (or no tkinter)")
@@ -876,6 +1123,64 @@ class WindowTests(TempDataDir):
                       "dates and focus keywords and click Squish!",
                       app.results.summary.cget("text"))
 
+    def test_documents_only_run_says_part_of_the_documents(self):
+        # Focus keywords that match documents but no emails: only a documents file.
+        a = projects.new_project("Alpha")
+        a["focus_keywords"] = "pump"
+        app = self.open_app([a])
+        run = self.fake_run(app, a)
+        run["filters"] = gui.filter_summary(a)
+        result = dict(DocumentHelperTests.DOCS_ONLY, elapsed_s=1,
+                      files=[dict(DocumentHelperTests.DOCS_ONLY["files"][0],
+                                  path=os.path.join(self.data_dir, "Squish - Alpha - documents - "
+                                                    "2025-01-01 to 2025-01-02 (focus pump).txt"))])
+        app._run_done(1, result)
+        status = app.status.cget("text")
+        self.assertIn("1 file ready", status)
+        self.assertIn("only documents mentioning pump", status)
+        self.assertNotIn("conversations", status)
+        summary = app.results.summary.cget("text")
+        self.assertIn("so this run made only a documents file", summary)
+        self.assertIn("This file has only part of the documents - for the full digest, clear the "
+                      "dates and focus keywords and click Squish!", summary)
+        self.assertNotIn("part of the emails", summary)
+        # Shown again later (from the saved last_run): the same words.
+        app.select_project(a["id"])
+        self.assertIn("only part of the documents", app.results.summary.cget("text"))
+
+    def test_dates_hint_says_the_documents_folder_is_not_dated(self):
+        app = self.open_app([projects.new_project("Alpha")])
+        form = app.form
+        form.from_var.set("2025-03-01")
+        self.assertIn("Only these dates", form.dates_hint.cget("text"))
+        self.assertNotIn("whatever their date", form.dates_hint.cget("text"))
+        form.docs_var.set(os.path.join(self.data_dir, "Reports"))
+        self.assertIn("Only these dates", form.dates_hint.cget("text"))
+        self.assertIn("(only <dates>)", form.dates_hint.cget("text"))
+        self.assertIn("Files in the documents folder are included whatever their date.",
+                      form.dates_hint.cget("text"))
+        form.from_var.set("")
+        self.assertNotIn("whatever their date", form.dates_hint.cget("text"))
+        self.assertIn("files in the documents folder (Documents tab) are always included, "
+                      "whatever their date", " ".join(gui.HOW_TO.split()))     # and Help says so
+
+    def test_read_stage_mentions_the_attachments(self):
+        a = projects.new_project("Alpha")
+        a["source_folder"] = tempfile.mkdtemp(dir=self.data_dir)
+        app = self.open_app([a])
+        self.start_without_engine(app, app.start_run)
+        self.assertTrue(app.run["attachments"])
+        app._show_progress(app.run["id"], "read", 55, 164, "")
+        self.assertEqual(app.status.cget("text"), "Reading emails and attachments 55 of 164...")
+        app._run_finished()
+        a["docs_from_attachments"] = False
+        app.form.attachments_var.set(False)
+        self.start_without_engine(app, app.start_run)
+        self.assertFalse(app.run["attachments"])
+        app._show_progress(app.run["id"], "read", 55, 164, "")
+        self.assertEqual(app.status.cget("text"), "Reading 55 of 164 emails...")
+        app._run_finished()
+
     def test_done_is_amber_when_emails_may_be_missing(self):
         a = projects.new_project("Alpha")
         app = self.open_app([a])
@@ -1066,6 +1371,14 @@ class WindowTests(TempDataDir):
                          "Attachments are only listed by name in the emails file.")
         form.docs_var.set("")
         self.assertIn("no documents file is made", form.attachments_hint.cget("text"))
+        # The blank folder's hint agrees with the unticked box (and follows it).
+        app.start_docs_count()
+        self.assertIn("Leave blank for no documents folder.", form.docs_hint.cget("text"))
+        self.assertNotIn("attachments", form.docs_hint.cget("text"))
+        form.attachments_var.set(True)
+        self.assertIsNotNone(app.docs_count_job)          # the hint is brought up to date
+        app.start_docs_count()
+        self.assertIn("Leave blank to condense only the attachments.", form.docs_hint.cget("text"))
 
     def test_documents_folder_is_counted(self):
         folder = os.path.join(self.data_dir, "Reports")
@@ -1079,7 +1392,7 @@ class WindowTests(TempDataDir):
         app.start_docs_count()
         self.assertTrue(self.wait_for(app, lambda: "found" in hint.cget("text")))
         self.assertEqual(hint.cget("text"), "3 documents found (incl. subfolders) - plus 1 other "
-                                            "file, listed by name only.")
+                                            "file, listed, not read.")
         self.assertEqual(hint.cget("style"), "Good.TLabel")
         app.form.docs_subfolders_var.set(False)
         app.start_docs_count()
@@ -1101,6 +1414,21 @@ class WindowTests(TempDataDir):
         self.assertIsNotNone(app.run)
         app.run = None
 
+    def test_documents_folder_of_emails_only(self):
+        # The documents folder may be the emails folder: not "No files here."
+        folder = os.path.join(self.data_dir, "01 Emails")
+        os.makedirs(folder)
+        for name in ("a.msg", "b.msg", "c.eml"):
+            with open(os.path.join(folder, name), "w") as fh:
+                fh.write("x")
+        app = self.open_app([projects.new_project("Alpha")])
+        hint = app.form.docs_hint
+        app.form.docs_var.set(folder)
+        app.start_docs_count()
+        self.assertTrue(self.wait_for(app, lambda: "here" in hint.cget("text")))
+        self.assertIn("Only emails here (3 email files", hint.cget("text"))
+        self.assertNotEqual(hint.cget("style"), "Warn.TLabel")
+
     def test_pdf_reader_line(self):
         app = self.open_app([projects.new_project("Alpha")])
         hint = app.form.pdf_hint
@@ -1108,7 +1436,8 @@ class WindowTests(TempDataDir):
         app.form.set_hint(hint, gui.PDF_CHECKING)
         self.assertEqual(hint.cget("text"), "checking...")
         app.handle_message(("pdf_backend", "PDF: pypdf 5.1.0"))
-        self.assertEqual(hint.cget("text"), "pypdf 5.1.0")
+        self.assertEqual(hint.cget("text"), "Installed (pypdf 5.1.0) - PDFs are read with the "
+                                            "better reader.")
         app.handle_message(("pdf_backend", "PDF: built-in reader (install pypdf for best results)"))
         self.assertEqual(hint.cget("text"), gui.PDF_ADVICE)
         with mock.patch.object(gui.messagebox, "showinfo") as about:
@@ -1147,11 +1476,11 @@ class WindowTests(TempDataDir):
         app = self.open_app([a])
         self.fake_run(app, a)
         app._show_progress(1, "documents", 12, 64, "Reading documents... 12 of 64")
-        self.assertEqual(app.status.cget("text"), "Condensing documents 12 of 64...")
+        self.assertEqual(app.status.cget("text"), "Condensing documents: 12 of 64 files...")
         self.assertEqual(str(app.progress.cget("mode")), "determinate")
         self.assertEqual(float(app.progress.cget("value")), 12.0)
-        app._show_progress(1, "documents", 1, 1, "Found 70 documents")
-        self.assertEqual(app.status.cget("text"), "Found 70 documents")
+        app._show_progress(1, "documents", 1, 1, "Found 70 files")
+        self.assertEqual(app.status.cget("text"), "Found 70 files")
         app._show_progress(1, "documents", 3, 64, "")
         app.cancel_run()
         self.assertIn("documents", app.status.cget("text"))
@@ -1179,8 +1508,9 @@ class WindowTests(TempDataDir):
         self.assertEqual([r[-1] for r in rows], ["1,876 emails", "64 documents"])
         self.assertEqual(rows[1][0], "documents - 2024-08-22 to 2025-11-30.txt")
         self.assertEqual(tree.selection(), ("0",))      # the emails file is picked first
-        self.assertIn("73 documents condensed", app.results.summary.cget("text"))
-        self.assertIn("add the documents file when you need what the attachments say",
+        self.assertIn("73 documents (incl. 9 drawings) in 1 documents file",
+                      app.results.summary.cget("text"))
+        self.assertIn("add the documents file when you need what the documents say",
                       app.status.cget("text"))
         self.assertEqual(app.status.cget("style"), "StatusGood.TLabel")
         # A documents folder that couldn't be read makes the Done message amber.
@@ -1188,10 +1518,40 @@ class WindowTests(TempDataDir):
         app._run_done(1, {"files": [emails, docs], "elapsed_s": 4, "failed": [], "stats": {},
                           "doc_problems": [["H:\\Reports", "documents folder not found: VPN?"]]})
         self.assertEqual(app.status.cget("style"), "StatusWarn.TLabel")
+        # So does a documents digest that couldn't be made: the emails file alone
+        # was written, and the earlier documents file (still in the folder) is old.
+        self.fake_run(app, a)
+        app._run_done(1, {"files": [emails], "elapsed_s": 4, "failed": [], "doc_problems": [],
+                          "stats": {"emails_used": 1876}, "doc_digest_failed": True})
+        self.assertEqual(app.status.cget("style"), "StatusWarn.TLabel")
+        self.assertIn("The documents file couldn't be made this time", app.status.cget("text"))
+        self.assertIn("is from an earlier run", app.results.summary.cget("text"))
+        self.assertTrue(projects.find_project(app.projects, a["id"])["last_run"][
+            "doc_digest_failed"])
+        # ... also when the filters left no emails to write either.
+        self.fake_run(app, a)
+        app._run_done(1, {"files": [], "doc_digest_failed": True})
+        self.assertIn("The documents file couldn't be made either", app.status.cget("text"))
+        self.fake_run(app, a)
+        app._run_done(1, {"files": [emails, docs], "elapsed_s": 4, "failed": [], "stats": {},
+                          "doc_problems": []})
         # Shown again later (from the saved last_run): the same table.
         app.select_project(a["id"])
         rows = [tree.item(i, "values") for i in tree.get_children()]
         self.assertEqual([r[1] for r in rows], ["Emails", "Documents"])
+
+    def test_compact_layout_keeps_squeeze_levels_short(self):
+        # The notebook is as tall as its tallest tab (the Squeeze tab): the compact
+        # layout leaves out the documents sentence, so the table keeps its rows.
+        app = self.open_app([projects.new_project("Alpha")], compact=True)
+        texts = dict((key, text) for key, _label, text in app.form.squeeze_choices)
+        self.assertFalse([t for t in texts.values() if "characters each" in t])
+        self.assertTrue(texts["standard"].startswith("Long emails trimmed"))
+
+    def test_normal_layout_says_what_squeeze_does_to_documents(self):
+        app = self.open_app([projects.new_project("Alpha")], compact=False)
+        texts = dict((key, text) for key, _label, text in app.form.squeeze_choices)
+        self.assertIn("Long documents condensed to about 8,000 characters each.", texts["standard"])
 
     def test_file_column_fits_a_small_window(self):
         app = self.open_app([projects.new_project("Alpha")], compact=True)

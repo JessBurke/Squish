@@ -33,8 +33,14 @@ between words.
 
 Damaged or hostile files never raise out of ``extract_pdf`` and never hang:
 nesting depth, objects read, decompressed bytes, operators per page, text
-characters and run time are all capped. Encrypted files are reported as
-"protected" (their text is not decrypted).
+characters and run time are all capped.
+
+Encrypted PDFs: many are "locked" with an owner password only. They open
+without a password but restrict printing or copying, and their strings and
+streams are encrypted with a key worked out from the empty user password.
+Those are decrypted and read (the standard security handler: RC4 40-128 bit,
+AES-128 and AES-256, see "Encryption" below). A PDF that needs a password to
+open, or uses another kind of lock, is reported as "protected".
 
 Main entry point: ``extract_pdf(data=None, path=None, max_pages=300)``.
 """
@@ -43,6 +49,7 @@ import array
 import binascii
 import bisect
 import collections
+import hashlib
 import html
 import math
 import re
@@ -64,8 +71,9 @@ __all__ = ["extract_pdf", "PdfError"]
 
 MAX_FILE_BYTES = 64 * 1024 * 1024       # bigger files are not read (Squish passes <= 40 MB)
 TIME_BUDGET = 20.0                      # seconds per document; text read so far is kept
-MAX_STREAM_BYTES = 64 * 1024 * 1024     # decompressed size of one stream (big CAD drawings)
+MAX_STREAM_BYTES = 64 * 1024 * 1024     # decompressed size of one stream (fonts, maps, images...)
 MAX_TOTAL_DECODED = 200 * 1024 * 1024   # decompressed bytes per document
+MAX_CONTENT_BYTES = MAX_TOTAL_DECODED   # one page or form content stream (A1 CAD sheets); the document budget still bounds it
 MAX_OBJECTS = 500000                    # objects loaded per document
 MAX_NESTING = 100                       # arrays/dictionaries inside each other
 MAX_ITEMS = 200000                      # items in one array or dictionary
@@ -197,6 +205,9 @@ _WINGDINGS = {0x6C: "\u25cf", 0x6E: "\u25a0", 0x6F: "\u25a1", 0x71: "\u2751",
               0x76: "\u2756", 0x77: "\u25c6", 0xA7: "\u25aa", 0xA8: "\u25fb",
               0xD8: "\u27a2", 0xE8: "\u2794", 0xFB: "\u2717", 0xFC: "\u2713",
               0xFD: "\u2612", 0xFE: "\u2611"}
+# Wingdings 2: the tick boxes and crosses of forms (other symbols are bullets).
+_WINGDINGS2 = {0x4F: "\u2717", 0x50: "\u2713", 0x51: "\u2612", 0x52: "\u2611",
+               0x53: "\u2612", 0x54: "\u2612", 0xA3: "\u2610"}
 _DINGBATS = {0x33: "\u2713", 0x34: "\u2714", 0x35: "\u2715", 0x36: "\u2716",
              0x37: "\u2717", 0x38: "\u2718", 0x6C: "\u25cf", 0x6E: "\u25a0",
              0x75: "\u25c6"}
@@ -383,14 +394,21 @@ Ref = collections.namedtuple("Ref", "num gen")   # "12 0 R": a reference to obje
 
 
 class _Stream:
-    """A stream object: its dictionary and where its raw bytes are in the file."""
+    """A stream object: its dictionary and where its raw bytes are in the file.
 
-    __slots__ = ("dict", "start", "end")
+    ``num`` and ``gen`` are its object number and generation (None for a
+    stream that is not a numbered object); an encrypted file needs them to
+    decrypt the stream.
+    """
 
-    def __init__(self, dictionary, start, end):
+    __slots__ = ("dict", "start", "end", "num", "gen")
+
+    def __init__(self, dictionary, start, end, num=None, gen=0):
         self.dict = dictionary
         self.start = start
         self.end = end
+        self.num = num
+        self.gen = gen
 
 
 _REGULAR = rb"[^\x00\t\n\x0c\r ()<>\[\]{}/%]"
@@ -940,6 +958,337 @@ def _run_length(data, limits, cap):
 
 
 # --------------------------------------------------------------------------
+# Encryption: the "standard security handler" with the empty user password
+# --------------------------------------------------------------------------
+#
+# A PDF "locked" with an owner password only opens without a password: its
+# strings and streams are encrypted with a key worked out from the empty user
+# password, so any reader can decrypt them. (A PDF that needs a password to
+# open cannot be decrypted without it and stays "protected".) Each object is
+# encrypted with RC4 (40-128 bit keys) or AES-128 using a key made from the
+# file key and the object's number, or with AES-256 using the file key
+# itself (ISO 32000-2, 7.6). AES is written out below because the standard
+# library has none; it is slow (about 1 MB a second) but only the streams that
+# are read are decrypted, images never.
+
+_PASSWORD_PAD = bytes.fromhex("28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A")
+_CRYPT_PIECE = 64 * 1024     # decrypt in pieces of this size (time budget checked in between)
+
+
+def _rc4(key, data, limits=None):
+    """RC4 (it both encrypts and decrypts)."""
+    s = list(range(256))
+    j = 0
+    size = len(key)
+    for i in range(256):
+        j = (j + s[i] + key[i % size]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+    out = bytearray(data)
+    i = j = 0
+    for start in range(0, len(out), _CRYPT_PIECE):
+        if limits is not None:
+            limits.check_time()
+        for k in range(start, min(start + _CRYPT_PIECE, len(out))):
+            i = (i + 1) & 0xFF
+            si = s[i]
+            j = (j + si) & 0xFF
+            sj = s[j]
+            s[i] = sj
+            s[j] = si
+            out[k] ^= s[(si + sj) & 0xFF]
+    return bytes(out)
+
+
+def _xtime(a):
+    """Multiply by 2 in AES's finite field."""
+    a <<= 1
+    return a ^ 0x11B if a & 0x100 else a
+
+
+def _gmul(a, b):
+    """Multiply two bytes in AES's finite field."""
+    out = 0
+    while b:
+        if b & 1:
+            out ^= a
+        a = _xtime(a)
+        b >>= 1
+    return out
+
+
+def _aes_sbox():
+    """The AES S-box (FIPS-197 5.1.1), built from the field's inverses."""
+    sbox = [0x63] * 256
+    p = q = 1
+    while True:
+        p = (p ^ (p << 1) ^ (0x1B if p & 0x80 else 0)) & 0xFF      # p * 3
+        q ^= q << 1                                                # q / 3
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        x = q
+        for shift in (1, 2, 3, 4):
+            x ^= ((q << shift) | (q >> (8 - shift))) & 0xFF
+        sbox[p] = x ^ 0x63
+        if p == 1:
+            return sbox
+
+
+_SBOX = _aes_sbox()
+_INV_SBOX = [0] * 256
+for _code, _value in enumerate(_SBOX):
+    _INV_SBOX[_value] = _code
+
+
+def _word(a, b, c, d):
+    return (a << 24) | (b << 16) | (c << 8) | d
+
+
+def _rotations(word):
+    """The four byte-rotations of a 32-bit word (one lookup table each)."""
+    return [((word >> (8 * k)) | (word << (32 - 8 * k))) & 0xFFFFFFFF for k in range(4)]
+
+
+# Lookup tables that do SubBytes + MixColumns (encryption) and their
+# inverses (decryption) on a whole column at once.
+_TE = [[0] * 256 for _k in range(4)]
+_TD = [[0] * 256 for _k in range(4)]
+for _code in range(256):
+    _s = _SBOX[_code]
+    _i = _INV_SBOX[_code]
+    for _k, _w in enumerate(_rotations(_word(_gmul(_s, 2), _s, _s, _gmul(_s, 3)))):
+        _TE[_k][_code] = _w
+    for _k, _w in enumerate(_rotations(_word(_gmul(_i, 14), _gmul(_i, 9), _gmul(_i, 13), _gmul(_i, 11)))):
+        _TD[_k][_code] = _w
+
+
+def _aes_key_schedule(key):
+    """Round keys (32-bit words) for a 16- or 32-byte key, and the number of rounds."""
+    nk = len(key) // 4
+    rounds = nk + 6
+    words = list(struct.unpack(">%dI" % nk, key))
+    rcon = 1
+    for i in range(nk, 4 * (rounds + 1)):
+        t = words[i - 1]
+        if i % nk == 0:
+            t = ((t << 8) | (t >> 24)) & 0xFFFFFFFF
+            t = _word(_SBOX[t >> 24], _SBOX[(t >> 16) & 255], _SBOX[(t >> 8) & 255], _SBOX[t & 255])
+            t ^= rcon << 24
+            rcon = _xtime(rcon)
+        elif nk > 6 and i % nk == 4:
+            t = _word(_SBOX[t >> 24], _SBOX[(t >> 16) & 255], _SBOX[(t >> 8) & 255], _SBOX[t & 255])
+        words.append(words[i - nk] ^ t)
+    return words, rounds
+
+
+def _aes_decrypt_keys(key):
+    """Round keys for decryption: in reverse order, the middle ones un-mixed."""
+    words, rounds = _aes_key_schedule(key)
+    t0, t1, t2, t3 = _TD
+    keys = []
+    for r in range(rounds, -1, -1):
+        part = words[4 * r:4 * r + 4]
+        if 0 < r < rounds:
+            part = [t0[_SBOX[w >> 24]] ^ t1[_SBOX[(w >> 16) & 255]] ^ t2[_SBOX[(w >> 8) & 255]]
+                    ^ t3[_SBOX[w & 255]] for w in part]
+        keys.extend(part)
+    return keys, rounds
+
+
+def _aes_cbc_decrypt(key, data, limits=None, iv=None, unpad=True):
+    """AES-CBC decryption. Without ``iv`` the first 16 bytes are the IV; the
+    PKCS#5 padding at the end is removed when ``unpad``."""
+    if iv is None:
+        iv, data = data[:16], data[16:]
+    if len(iv) != 16:
+        return b""
+    keys, rounds = _aes_decrypt_keys(key)
+    t0, t1, t2, t3 = _TD
+    inv = _INV_SBOX
+    count = len(data) // 16
+    words = struct.unpack(">%dI" % (4 * count), data[:16 * count])
+    out = [0] * (4 * count)
+    p0, p1, p2, p3 = struct.unpack(">4I", iv)
+    last = 4 * rounds
+    for b in range(0, 4 * count, 4):
+        if limits is not None and b & 0x3FFF == 0:
+            limits.check_time()
+        c0, c1, c2, c3 = words[b:b + 4]
+        s0, s1, s2, s3 = c0 ^ keys[0], c1 ^ keys[1], c2 ^ keys[2], c3 ^ keys[3]
+        for k in range(4, last, 4):
+            s0, s1, s2, s3 = (
+                t0[s0 >> 24] ^ t1[(s3 >> 16) & 255] ^ t2[(s2 >> 8) & 255] ^ t3[s1 & 255] ^ keys[k],
+                t0[s1 >> 24] ^ t1[(s0 >> 16) & 255] ^ t2[(s3 >> 8) & 255] ^ t3[s2 & 255] ^ keys[k + 1],
+                t0[s2 >> 24] ^ t1[(s1 >> 16) & 255] ^ t2[(s0 >> 8) & 255] ^ t3[s3 & 255] ^ keys[k + 2],
+                t0[s3 >> 24] ^ t1[(s2 >> 16) & 255] ^ t2[(s1 >> 8) & 255] ^ t3[s0 & 255] ^ keys[k + 3])
+        out[b] = _word(inv[s0 >> 24], inv[(s3 >> 16) & 255], inv[(s2 >> 8) & 255], inv[s1 & 255]) ^ keys[last] ^ p0
+        out[b + 1] = _word(inv[s1 >> 24], inv[(s0 >> 16) & 255], inv[(s3 >> 8) & 255], inv[s2 & 255]) ^ keys[last + 1] ^ p1
+        out[b + 2] = _word(inv[s2 >> 24], inv[(s1 >> 16) & 255], inv[(s0 >> 8) & 255], inv[s3 & 255]) ^ keys[last + 2] ^ p2
+        out[b + 3] = _word(inv[s3 >> 24], inv[(s2 >> 16) & 255], inv[(s1 >> 8) & 255], inv[s0 & 255]) ^ keys[last + 3] ^ p3
+        p0, p1, p2, p3 = c0, c1, c2, c3
+    result = struct.pack(">%dI" % (4 * count), *out)
+    if unpad and result and 1 <= result[-1] <= 16:
+        result = result[:-result[-1]]
+    return result
+
+
+def _aes_cbc_encrypt(key, iv, data):
+    """AES-CBC encryption without padding (``data`` is a whole number of blocks).
+    Needed only to check AES-256 (revision 6) passwords, and by the tests."""
+    words_key, rounds = _aes_key_schedule(key)
+    t0, t1, t2, t3 = _TE
+    sb = _SBOX
+    count = len(data) // 16
+    words = struct.unpack(">%dI" % (4 * count), data[:16 * count])
+    out = [0] * (4 * count)
+    p0, p1, p2, p3 = struct.unpack(">4I", iv)
+    last = 4 * rounds
+    for b in range(0, 4 * count, 4):
+        s0 = words[b] ^ p0 ^ words_key[0]
+        s1 = words[b + 1] ^ p1 ^ words_key[1]
+        s2 = words[b + 2] ^ p2 ^ words_key[2]
+        s3 = words[b + 3] ^ p3 ^ words_key[3]
+        for k in range(4, last, 4):
+            s0, s1, s2, s3 = (
+                t0[s0 >> 24] ^ t1[(s1 >> 16) & 255] ^ t2[(s2 >> 8) & 255] ^ t3[s3 & 255] ^ words_key[k],
+                t0[s1 >> 24] ^ t1[(s2 >> 16) & 255] ^ t2[(s3 >> 8) & 255] ^ t3[s0 & 255] ^ words_key[k + 1],
+                t0[s2 >> 24] ^ t1[(s3 >> 16) & 255] ^ t2[(s0 >> 8) & 255] ^ t3[s1 & 255] ^ words_key[k + 2],
+                t0[s3 >> 24] ^ t1[(s0 >> 16) & 255] ^ t2[(s1 >> 8) & 255] ^ t3[s2 & 255] ^ words_key[k + 3])
+        p0 = _word(sb[s0 >> 24], sb[(s1 >> 16) & 255], sb[(s2 >> 8) & 255], sb[s3 & 255]) ^ words_key[last]
+        p1 = _word(sb[s1 >> 24], sb[(s2 >> 16) & 255], sb[(s3 >> 8) & 255], sb[s0 & 255]) ^ words_key[last + 1]
+        p2 = _word(sb[s2 >> 24], sb[(s3 >> 16) & 255], sb[(s0 >> 8) & 255], sb[s1 & 255]) ^ words_key[last + 2]
+        p3 = _word(sb[s3 >> 24], sb[(s0 >> 16) & 255], sb[(s1 >> 8) & 255], sb[s2 & 255]) ^ words_key[last + 3]
+        out[b:b + 4] = [p0, p1, p2, p3]
+    return struct.pack(">%dI" % (4 * count), *out)
+
+
+def _hash_r6(password, salt, user_key=b""):
+    """Password hash of AES-256 revision 6 files (ISO 32000-2, algorithm 2.B)."""
+    k = hashlib.sha256(password + salt + user_key).digest()
+    i = 0
+    while True:
+        e = _aes_cbc_encrypt(k[:16], k[16:32], (password + k + user_key) * 64)
+        k = (hashlib.sha256, hashlib.sha384, hashlib.sha512)[sum(e[:16]) % 3](e).digest()
+        i += 1
+        if i >= 64 and e[-1] <= i - 32:
+            return k[:32]
+
+
+_CRYPT_METHODS = {"V2": "rc4", "AESV2": "aes", "AESV3": "aes256"}
+
+
+class _Security:
+    """Decrypts a PDF locked with the standard security handler, using the
+    empty user password. Raises PdfError("password") when the file needs a
+    password to open and PdfError("unsupported") for any other kind of lock."""
+
+    def __init__(self, encrypt, file_id, resolve):
+        def get(key, default=None):
+            value = resolve(encrypt.get(key))
+            return default if value is None else value
+
+        if get("Filter") != "Standard":
+            raise PdfError("unsupported")
+        version, revision = get("V", 0), get("R", 0)
+        owner, user, perms = get("O", b""), get("U", b""), get("P", 0)
+        if not (isinstance(owner, bytes) and isinstance(user, bytes) and type(perms) is int):
+            raise PdfError("unsupported")
+        self.encrypt_metadata = get("EncryptMetadata", True) is not False
+        self.version = version
+        self._filters = {}
+        filters = get("CF", {})
+        if isinstance(filters, dict):
+            for name, value in filters.items():
+                value = resolve(value)
+                method = resolve(value.get("CFM")) if isinstance(value, dict) else None
+                self._filters[name] = _CRYPT_METHODS.get(method)
+        if version in (1, 2, 4) and revision in (2, 3, 4):
+            if version == 4:
+                self.stream_method = self.method_named(get("StmF", "Identity"))
+                self.string_method = self.method_named(get("StrF", "Identity"))
+                if "aes256" in (self.stream_method, self.string_method):
+                    raise PdfError("unsupported")
+            else:
+                self.stream_method = self.string_method = "rc4"
+            length = get("Length", 40 if version < 4 else 128)
+            size = 5 if revision == 2 else (length // 8 if type(length) is int and 40 <= length <= 128 else 16)
+            self.key = self._rc4_file_key(owner, perms, file_id, revision, size)
+            if not self._user_password_works(user, file_id, revision):
+                raise PdfError("password")
+        elif version == 5 and revision in (5, 6):
+            self.stream_method = self.method_named(get("StmF", "Identity"))
+            self.string_method = self.method_named(get("StrF", "Identity"))
+            user_key = get("UE", b"")
+            if len(user) < 48 or not isinstance(user_key, bytes) or len(user_key) < 32:
+                raise PdfError("unsupported")
+            hash_ = (lambda salt: hashlib.sha256(salt).digest()) if revision == 5 else (
+                lambda salt: _hash_r6(b"", salt))
+            if hash_(user[32:40]) != user[:32]:
+                raise PdfError("password")
+            key = hash_(user[40:48])
+            self.key = _aes_cbc_decrypt(key, user_key[:32], iv=bytes(16), unpad=False)
+        else:
+            raise PdfError("unsupported")
+
+    def method_named(self, name):
+        """"rc4", "aes", "aes256" or None (not encrypted) for a crypt filter name."""
+        if name == "Identity" or name is None:
+            return None
+        if self.version < 4:
+            return "rc4"
+        return self._filters.get(name)
+
+    def _rc4_file_key(self, owner, perms, file_id, revision, size):
+        """The file key (ISO 32000-1 7.6.3.3, algorithm 2) for the empty password."""
+        digest = hashlib.md5(_PASSWORD_PAD + owner[:32] + struct.pack("<I", perms & 0xFFFFFFFF) + file_id)
+        if revision >= 4 and not self.encrypt_metadata:
+            digest.update(b"\xff\xff\xff\xff")
+        key = digest.digest()[:size]
+        if revision >= 3:
+            for _ in range(50):
+                key = hashlib.md5(key).digest()[:size]
+        return key
+
+    def _user_password_works(self, user, file_id, revision):
+        """True when the empty password opens the file (algorithms 4 and 5)."""
+        if revision == 2:
+            return _rc4(self.key, _PASSWORD_PAD) == user[:32]
+        check = _rc4(self.key, hashlib.md5(_PASSWORD_PAD + file_id).digest())
+        for i in range(1, 20):
+            check = _rc4(bytes(b ^ i for b in self.key), check)
+        return check == user[:16]
+
+    def decrypt(self, num, gen, data, method, limits=None):
+        """Decrypt one string or stream of object ``num`` (generation ``gen``)."""
+        if method is None or not data:
+            return data
+        if method == "aes256":
+            key = self.key
+        else:
+            salt = b"sAlT" if method == "aes" else b""
+            key = hashlib.md5(self.key + struct.pack("<I", num & 0xFFFFFF)[:3]
+                              + struct.pack("<I", gen & 0xFFFF)[:2] + salt).digest()
+            key = key[:min(len(self.key) + 5, 16)]
+        if method == "rc4":
+            return _rc4(key, data, limits)
+        return _aes_cbc_decrypt(key, data, limits)
+
+    def decrypt_strings(self, num, gen, value, depth=0):
+        """A parsed object with every string in it decrypted."""
+        if isinstance(value, bytes):
+            return self.decrypt(num, gen, value, self.string_method)
+        if depth > MAX_NESTING:
+            return value
+        if isinstance(value, list):
+            return [self.decrypt_strings(num, gen, item, depth + 1) for item in value]
+        if isinstance(value, dict):
+            return dict((key, self.decrypt_strings(num, gen, item, depth + 1)) for key, item in value.items())
+        return value
+
+
+# --------------------------------------------------------------------------
 # Document: cross-reference table, objects, page tree
 # --------------------------------------------------------------------------
 
@@ -983,6 +1332,9 @@ class _Document:
         self._header_num = None  # ... and their object numbers
         self._objstm = {}        # object stream number -> {object number: value}
         self._compressed = None  # object number -> object stream number, from scanning
+        self.security = None     # _Security of a locked PDF that opens without a password
+        self.lock_reason = None  # "password" or "unsupported" when it cannot be decrypted
+        self._encrypt_num = None # the /Encrypt dictionary's object number (never encrypted)
         head = data.find(b"%PDF-", 0, 1024)
         self.shift = head if head > 0 else 0   # junk before the header moves every offset
 
@@ -996,9 +1348,37 @@ class _Document:
             raise
         except Exception:
             self.damaged = True
+        self._setup_security()
         if not self._good_root(self.trailer.get("Root")):
             self.damaged = True
             self._rebuild_trailer()
+            self._setup_security()
+
+    def _setup_security(self):
+        """Prepare decryption when the trailer names an /Encrypt dictionary."""
+        ref = self.trailer.get("Encrypt")
+        if ref is None or self.security is not None:
+            return
+        self._encrypt_num = ref.num if isinstance(ref, Ref) else None
+        encrypt = self.resolve(ref)
+        ids = self.resolve(self.trailer.get("ID"))
+        first = self.resolve(ids[0]) if isinstance(ids, list) and ids else b""
+        try:
+            self.security = _Security(encrypt if isinstance(encrypt, dict) else {},
+                                      first if isinstance(first, bytes) else b"", self.resolve)
+        except PdfError as exc:
+            self.lock_reason = str(exc)
+            return
+        except (_OutOfBudget, _PageFull):
+            raise
+        except Exception:
+            self.lock_reason = "unsupported"
+            return
+        self.lock_reason = None
+        # Objects read so far (looking for the catalog) were not decrypted.
+        self._cache = {}
+        self._objstm = {}
+        self._compressed = None
 
     @property
     def catalog(self):
@@ -1007,7 +1387,8 @@ class _Document:
 
     @property
     def encrypted(self):
-        return self.trailer.get("Encrypt") is not None
+        """True for an encrypted PDF that cannot be decrypted."""
+        return self.trailer.get("Encrypt") is not None and self.security is None
 
     def _good_root(self, value):
         root = self.resolve(value)
@@ -1197,13 +1578,17 @@ class _Document:
             value, pos = _parse_object(data, m.end(), self.limits)
         except PdfError:
             return _MISSING
+        obj_num, gen = int(m.group(1)), int(m.group(2))
+        if self.security is not None and obj_num != self._encrypt_num and \
+                not (isinstance(value, dict) and value.get("Type") == "XRef"):
+            value = self.security.decrypt_strings(obj_num, gen, value)
         if isinstance(value, dict):
             s = _STREAM_KW_RE.match(data, pos)
             if s:
-                value = self._make_stream(value, s.end())
+                value = self._make_stream(value, s.end(), obj_num, gen)
         return value
 
-    def _make_stream(self, info, start):
+    def _make_stream(self, info, start, num=None, gen=0):
         data = self.data
         length = self.resolve(info.get("Length"))
         end = None
@@ -1220,7 +1605,7 @@ class _Document:
                     end -= 1
                 if data[end - 1:end] == b"\r":
                     end -= 1
-        return _Stream(info, start, max(start, end))
+        return _Stream(info, start, max(start, end), num, gen)
 
     def _objstm_objects(self, stm_num):
         """Objects packed in an object stream: {object number: value}."""
@@ -1359,9 +1744,13 @@ class _Document:
             filters = [filters]
             parms = [parms]
         if not isinstance(filters, list):
-            return data[:cap]
+            filters = []
         if not isinstance(parms, list):
             parms = [parms] * len(filters)
+        if self.security is not None and stream.num is not None:
+            data = self._decrypt_stream(stream, filters, parms, data)
+            if data is None:
+                return None
         for i, name in enumerate(filters):
             name = self.resolve(name)
             parm = self.resolve(parms[i]) if i < len(parms) else None
@@ -1389,6 +1778,27 @@ class _Document:
             else:
                 return None                      # a filter this module does not know
         return data[:cap]
+
+    def _decrypt_stream(self, stream, filters, parms, data):
+        """The stream's raw bytes decrypted (as they are when it is not encrypted);
+        None for an image, which is never decrypted (it holds no text)."""
+        resolve = self.resolve
+        kind = resolve(stream.dict.get("Type"))
+        if kind == "XRef" or stream.num == self._encrypt_num:
+            return data
+        if kind == "Metadata" and not self.security.encrypt_metadata:
+            return data
+        method = self.security.stream_method
+        if filters and resolve(filters[0]) == "Crypt":
+            parm = resolve(parms[0]) if parms else None
+            name = resolve(parm.get("Name")) if isinstance(parm, dict) else None
+            method = self.security.method_named(name or "Identity")
+        if method is None:
+            return data
+        if any(resolve(name) in _IMAGE_FILTERS for name in filters):
+            return None
+        self.limits.add_decoded(len(data))
+        return self.security.decrypt(stream.num, stream.gen, data, method, self.limits)
 
     # ---- pages ----
 
@@ -1497,6 +1907,7 @@ def _parse_cmap(data, limits):
                 target = text_map.setdefault(len(low), {})
                 first = int.from_bytes(low, "big")
                 last = min(int.from_bytes(high, "big"), first + 65535)
+                last = min(last, first + MAX_CMAP_ENTRIES - entries)   # the cap holds inside one operator too
                 for offset, code in enumerate(range(first, last + 1)):
                     if isinstance(dst, list):
                         if offset >= len(dst):
@@ -1505,6 +1916,8 @@ def _parse_cmap(data, limits):
                     else:
                         target[code] = _cmap_text(dst, offset)
                     entries += 1
+                    if entries & 0xFFF == 0 and limits is not None:
+                        limits.check_time()
         elif op == b"endcidrange":
             for k in range(0, len(args) - 2, 3):
                 low, high, cid = args[k], args[k + 1], args[k + 2]
@@ -1512,9 +1925,12 @@ def _parse_cmap(data, limits):
                     target = cid_map.setdefault(len(low), {})
                     first = int.from_bytes(low, "big")
                     last = min(int.from_bytes(high, "big"), first + 65535)
+                    last = min(last, first + MAX_CMAP_ENTRIES - entries)
                     for offset, code in enumerate(range(first, last + 1)):
                         target[code] = cid + offset
-                    entries += last - first + 1
+                    entries += max(0, last - first + 1)
+                    if limits is not None:
+                        limits.check_time()
         elif op == b"endcidchar":
             for k in range(0, len(args) - 1, 2):
                 src, cid = args[k], args[k + 1]
@@ -1545,11 +1961,12 @@ def _cmap_text(dst, offset=0):
     return dst.decode("utf-16-be", "ignore")
 
 
-def _truetype_glyph_text(font_bytes):
+def _truetype_glyph_text(font_bytes, limits=None):
     """{glyph id: text} from an embedded TrueType font's 'cmap' table.
 
     Used for Identity-H fonts that have no /ToUnicode map: the font's own
-    character map says which Unicode character each glyph draws.
+    character map says which Unicode character each glyph draws. ``limits``
+    (optional) is asked for the time budget while a big map is expanded.
     """
     data = font_bytes
     result = {}
@@ -1576,7 +1993,7 @@ def _truetype_glyph_text(font_bytes):
         tables[(platform, encoding)] = offset
     for key in ((3, 10), (0, 4), (3, 1), (0, 3), (0, 1), (0, 0), (3, 0), (1, 0)):
         if key in tables:
-            mapping = _cmap_subtable(cmap, tables[key])
+            mapping = _cmap_subtable(cmap, tables[key], limits)
             for code in sorted(mapping):
                 char = code
                 if key == (3, 0) and 0xF000 <= code <= 0xF0FF:
@@ -1593,9 +2010,14 @@ def _truetype_glyph_text(font_bytes):
     return result
 
 
-def _cmap_subtable(cmap, offset):
-    """{character code: glyph id} from one TrueType cmap subtable (formats 0, 4, 6, 12)."""
+def _cmap_subtable(cmap, offset, limits=None):
+    """{character code: glyph id} from one TrueType cmap subtable (formats 0, 4, 6, 12).
+
+    The work is capped (MAX_CMAP_ENTRIES codes looked at, overlapping
+    segments counted each time) and the time budget is checked as it goes.
+    """
     mapping = {}
+    work = 0
     try:
         (fmt,) = struct.unpack(">H", cmap[offset:offset + 2])
         if fmt == 0:
@@ -1614,6 +2036,11 @@ def _cmap_subtable(cmap, offset):
             for s in range(segs):
                 if starts[s] > ends[s] or ends[s] - starts[s] > 65535:
                     continue
+                work += ends[s] - starts[s] + 1
+                if work > MAX_CMAP_ENTRIES:
+                    break
+                if work > 65536 and limits is not None:
+                    limits.check_time()
                 for code in range(starts[s], min(ends[s], 0xFFFE) + 1):
                     if range_offsets[s] == 0:
                         gid = (code + deltas[s]) & 0xFFFF
@@ -1626,8 +2053,6 @@ def _cmap_subtable(cmap, offset):
                             gid = (gid + deltas[s]) & 0xFFFF
                     if gid:
                         mapping[code] = gid
-                if len(mapping) > MAX_CMAP_ENTRIES:
-                    break
         elif fmt == 6:
             first, count = struct.unpack(">HH", cmap[offset + 6:offset + 10])
             gids = struct.unpack(">%dH" % count, cmap[offset + 10:offset + 10 + 2 * count])
@@ -1638,10 +2063,14 @@ def _cmap_subtable(cmap, offset):
             (groups,) = struct.unpack(">I", cmap[offset + 12:offset + 16])
             for g in range(min(groups, 100000)):
                 start, end, gid = struct.unpack(">III", cmap[offset + 16 + 12 * g:offset + 28 + 12 * g])
-                for code in range(start, min(end, start + 65535) + 1):
-                    mapping[code] = gid + code - start
-                if len(mapping) > MAX_CMAP_ENTRIES:
+                end = min(end, start + 65535)
+                work += max(0, end - start + 1)
+                if work > MAX_CMAP_ENTRIES:
                     break
+                if work > 65536 and limits is not None:
+                    limits.check_time()
+                for code in range(start, end + 1):
+                    mapping[code] = gid + code - start
     except struct.error:
         pass
     return mapping
@@ -1745,7 +2174,10 @@ def _base_font_name(font_dict):
 
 
 def _symbol_kind(name):
+    """"symbol", "wingdings", "wingdings2", "dingbats" or None for a font name."""
     lower = name.lower()
+    if "wingdings2" in lower.replace(" ", "").replace("-", ""):
+        return "wingdings2"
     if "wingding" in lower or "webding" in lower:
         return "wingdings"
     if "dingbat" in lower:
@@ -1755,15 +2187,27 @@ def _symbol_kind(name):
     return None
 
 
+def _symbol_table(kind):
+    """The 256 characters of a symbol font's own encoding."""
+    if kind == "symbol":
+        return _SYMBOL
+    if kind == "wingdings":
+        return _dingbat_table(_WINGDINGS)
+    if kind == "wingdings2":
+        return _dingbat_table(_WINGDINGS2)
+    return _dingbat_table(_DINGBATS)
+
+
 def _pua_fix(kind):
     """translate() table for private-use characters (U+F020-U+F0FF) of symbol fonts."""
-    if kind == "symbol":
-        base = _SYMBOL
-    elif kind == "wingdings":
-        base = _dingbat_table(_WINGDINGS)
-    else:
-        base = _dingbat_table(_DINGBATS)
+    base = _symbol_table(kind)
     return {0xF000 + code: base[code] for code in range(0x20, 0x100)}
+
+
+# For docs.py (Word symbols, PDFs read by pypdf): the same tables.
+SYMBOL_ENCODING = _SYMBOL
+symbol_font_kind = _symbol_kind
+symbol_pua_table = _pua_fix
 
 
 def _load_font(doc, font_dict, limits):
@@ -1805,12 +2249,8 @@ def _setup_simple(doc, font, font_dict, limits):
         base = _named_encoding(resolve(encoding.get("BaseEncoding")))
         differences = resolve(encoding.get("Differences"))
     if base is None:
-        if kind == "symbol":
-            base = _SYMBOL
-        elif kind == "wingdings":
-            base = _dingbat_table(_WINGDINGS)
-        elif kind == "dingbats":
-            base = _dingbat_table(_DINGBATS)
+        if kind is not None:
+            base = _symbol_table(kind)
         elif subtype in ("Type1", "MMType1"):
             base = _type1_builtin(doc, descriptor) or _STANDARD
         elif subtype == "Type3":
@@ -1946,7 +2386,7 @@ def _setup_composite(doc, font, font_dict, limits):
     if isinstance(program, _Stream):
         data = doc.decode_stream(program)
         if data:
-            font.gid_text = _truetype_glyph_text(data)
+            font.gid_text = _truetype_glyph_text(data, limits)
             mapping = resolve(desc.get("CIDToGIDMap"))
             if isinstance(mapping, _Stream):
                 font.cid_to_gid = doc.decode_stream(mapping) or b""
@@ -2005,6 +2445,15 @@ _TIDY.update({0x7F: None, 0x09: " ", 0xA0: " ", 0x200B: None, 0xFEFF: None,
               0xFB05: "st", 0xFB06: "st"})
 _PRIVATE_USE_RE = re.compile("[\ue000-\uf8ff]")
 _SPACES_RE = re.compile(" {3,}")
+
+# Annotations whose appearance stream is drawn onto the page (form fields,
+# typed-on text, stamps, and Bluebeam/Acrobat shapes that can carry text) ...
+_DRAWN = frozenset(["Widget", "FreeText", "Stamp", "Square", "Circle", "Polygon", "PolyLine", "Line"])
+# ... and the review markups whose typed comment (/Contents) is kept.
+_MARKUP = frozenset(["Text", "FreeText", "Stamp", "Square", "Circle", "Polygon", "PolyLine", "Line",
+                     "Ink", "Highlight", "Underline", "StrikeOut", "Squiggly", "Caret", "FileAttachment"])
+MAX_COMMENTS = 200          # review comments kept per page
+MAX_COMMENT_CHARS = 2000    # characters kept per comment
 
 
 def _mul(m1, m2):
@@ -2184,7 +2633,7 @@ class _TextCollector:
 
 
 def _tidy_lines(lines):
-    """Clean characters, join words hyphenated across lines, drop extra blank lines."""
+    """Clean characters, join words split at a hyphen across lines, drop extra blank lines."""
     cleaned = []
     for line in lines:
         line = line.translate(_TIDY)
@@ -2200,8 +2649,12 @@ def _tidy_lines(lines):
             continue
         soft = line[-1] == "\u00ad"
         if soft or (line[-1] in "-\u2010" and line[-2].islower() and nxt[0].islower()):
+            # The next word joins this line. A soft hyphen goes; a real hyphen
+            # stays ("self-weight"): Word and LibreOffice do not hyphenate
+            # words by themselves, so a hyphen at a line end is nearly always
+            # part of the word.
             word, _, rest = nxt.partition(" ")
-            cleaned[i] = line[:-1] + word
+            cleaned[i] = (line[:-1] if soft else line) + word
             cleaned[i + 1] = rest.lstrip() if rest.strip() else None
     out = []
     for line in cleaned:
@@ -2258,12 +2711,17 @@ class _PageReader:
         self.forms = set()
         self.stopped = None      # reason a budget ran out, if it did
         self.incomplete = 0      # pages cut short (too complex)
+        self.capped = False      # a content stream on this page was cut at its size cap
+        self.fonts_loaded = 0    # fonts built so far (the time budget is checked every 16)
 
     def page_text(self, page, attrs):
-        """Text of one page. A budget running out keeps what was read so far."""
+        """Text of one page, with its review comments (see _with_comments).
+        A budget running out keeps what was read so far."""
         self.out = _TextCollector()
         self.ops = 0
         self.forms = set()
+        self.capped = False
+        comments = []
         resolve = self.doc.resolve
         resources = resolve(attrs.get("Resources"))
         if not isinstance(resources, dict):
@@ -2271,25 +2729,34 @@ class _PageReader:
         try:
             data = self._contents(resolve(page.get("Contents")))
             self._run(data, resources, _GState(), 0)
-            self._annotations(page)
+            comments = self._annotations(page)
+            if self.capped:
+                self.incomplete += 1       # cut at a size cap: never silent (not a "scan")
         except _PageFull:
             self.incomplete += 1
         except _OutOfBudget as exc:
             self.stopped = exc.reason
         except Exception:                  # damaged content: keep what was read
             self.incomplete += 1
-        return self.out.text()
+        return _with_comments(self.out.text(), comments)
+
+    def _content(self, stream):
+        """Decoded bytes of a page or form content stream (b"" if unreadable)."""
+        data = self.doc.decode_stream(stream, MAX_CONTENT_BYTES) or b""
+        if len(data) >= MAX_CONTENT_BYTES:
+            self.capped = True
+        return data
 
     def _contents(self, contents):
         resolve = self.doc.resolve
         if isinstance(contents, _Stream):
-            return self.doc.decode_stream(contents) or b""
+            return self._content(contents)
         if isinstance(contents, list):
             parts = []
             for item in contents[:10000]:
                 item = resolve(item)
                 if isinstance(item, _Stream):
-                    parts.append(self.doc.decode_stream(item) or b"")
+                    parts.append(self._content(item))
             return b"\n".join(parts)
         return b""
 
@@ -2300,6 +2767,9 @@ class _PageReader:
         if font is None:
             font_dict = self.doc.resolve(ref)
             if isinstance(font_dict, dict):
+                self.fonts_loaded += 1
+                if self.fonts_loaded & 0xF == 0:
+                    self.limits.check_time()     # many fonts, each cheap, still add up
                 try:
                     font = _load_font(self.doc, font_dict, self.limits)
                 except (_OutOfBudget, _PageFull):
@@ -2462,7 +2932,7 @@ class _PageReader:
     def _run_form(self, form, resources, st, depth, key, outer_matrix):
         resolve = self.doc.resolve
         try:
-            data = self.doc.decode_stream(form)
+            data = self._content(form)
         except (_OutOfBudget, _PageFull):
             raise
         except Exception:
@@ -2497,23 +2967,42 @@ class _PageReader:
                 st.size = _num(resolve(font[1]))
 
     def _annotations(self, page):
-        """Text drawn by form fields and typed-on comments (their appearance streams)."""
+        """Draw the text of form fields, stamps and typed-on comments (their
+        appearance streams) onto the page, and return the review comments
+        typed into notes, clouds, highlights and other markups (/Contents).
+
+        Hidden annotations are skipped, and so are review-status entries
+        (/StateModel: "Accepted set by ..."); links and pop-ups hold no comment.
+        """
         resolve = self.doc.resolve
         annots = resolve(page.get("Annots"))
+        comments = []
         if not isinstance(annots, list):
-            return
+            return comments
         for annot in annots[:2000]:
             annot = resolve(annot)
-            if not isinstance(annot, dict) or annot.get("Subtype") not in ("Widget", "FreeText"):
+            if not isinstance(annot, dict):
+                continue
+            subtype = annot.get("Subtype")
+            if subtype not in _DRAWN and subtype not in _MARKUP:
                 continue
             flags = annot.get("F")
-            if type(flags) is int and flags & 2:     # hidden
+            if type(flags) is int and flags & (2 | 32):     # hidden, or not shown on screen
+                continue
+            if subtype in _MARKUP and len(comments) < MAX_COMMENTS and \
+                    "StateModel" not in annot and "State" not in annot:
+                comment = self._comment(annot)
+                if comment:
+                    comments.append(comment)
+            if subtype not in _DRAWN:
                 continue
             appearance = resolve(annot.get("AP"))
             normal = resolve(appearance.get("N")) if isinstance(appearance, dict) else None
             if isinstance(normal, dict):            # several states: use the current one
                 normal = resolve(normal.get(annot.get("AS")))
             if not isinstance(normal, _Stream):
+                if subtype == "Widget":
+                    self._field_value(annot)
                 continue
             place = self._annotation_matrix(annot, normal)
             if place is not None:
@@ -2522,6 +3011,67 @@ class _PageReader:
                     self._run_form(normal, {}, _GState(), 0, ("annot", id(normal)), place)
                 finally:
                     self.out.attach = False
+        return comments
+
+    def _comment(self, annot):
+        """The text typed into a markup annotation (/Contents, else its rich text /RC), on one line."""
+        resolve = self.doc.resolve
+        raw = resolve(annot.get("Contents"))
+        if isinstance(raw, bytes):
+            text = _text_string(raw[:4 * MAX_COMMENT_CHARS])
+        else:
+            rich = resolve(annot.get("RC"))
+            if isinstance(rich, _Stream):
+                rich = self.doc.decode_stream(rich, cap=64 * 1024)
+            if not isinstance(rich, bytes):
+                return ""
+            text = _raw_text_string(rich[:16 * MAX_COMMENT_CHARS])
+            text = html.unescape(re.sub(r"<[^>]*>", " ", text))
+            text = " ".join(text.translate(_TIDY).split())
+        if "\ue000" <= max(text, default="") and _PRIVATE_USE_RE.search(text):
+            text = _PRIVATE_USE_RE.sub("", text)
+        if len(text) > MAX_COMMENT_CHARS:
+            text = text[:MAX_COMMENT_CHARS].rsplit(" ", 1)[0] + " ..."
+        return text.strip()
+
+    def _field_value(self, annot):
+        """Write a text field's value (/V) that has no appearance stream.
+
+        Form fillers in browsers (and pypdf) often leave the value without
+        drawing it (/NeedAppearances): it goes at the top left of the field.
+        """
+        resolve = self.doc.resolve
+        kind = value = flags = None
+        field = annot
+        for _ in range(20):                      # the value may be on a parent field
+            if not isinstance(field, dict):
+                break
+            if kind is None:
+                kind = resolve(field.get("FT"))
+            if value is None:
+                value = resolve(field.get("V"))
+            if flags is None:
+                flags = resolve(field.get("Ff"))
+            field = resolve(field.get("Parent"))
+        if kind != "Tx" or not isinstance(value, bytes):
+            return
+        if type(flags) is int and flags & (1 << 13):     # a password field
+            return
+        rect = _rect(resolve(annot.get("Rect")), resolve)
+        if rect is None:
+            return
+        left, top = rect[0] + 2.0, rect[3]
+        size = min(10.0, max(4.0, (rect[3] - rect[1]) * 0.7))
+        y = top - size * 1.2
+        self.out.attach = True
+        try:
+            for line in re.split(r"\r\n|\r|\n", _raw_text_string(value))[:200]:
+                line = line.strip()
+                if line:
+                    self.out.add(left, y, left + len(line) * size * 0.5, y, 1.0, 0.0, size, line)
+                y -= size * 1.2
+        finally:
+            self.out.attach = False
 
     def _annotation_matrix(self, annot, form):
         """Matrix that puts an appearance stream's box onto the annotation's /Rect."""
@@ -2543,6 +3093,41 @@ class _PageReader:
         # The form's own /Matrix is applied by _run_form, so this maps the
         # transformed box onto the rectangle.
         return (sx, 0.0, 0.0, sy, rect[0] - min(xs) * sx, rect[1] - min(ys) * sy)
+
+
+def _comment_key(text):
+    """Letters and digits only, lower case: how a comment is compared with the page text."""
+    return re.sub(r"[\W_]+", "", text.lower())
+
+
+def _with_comments(text, comments):
+    """The page text with review comments added at the end, each on its own
+    line as "[comment: ...]" after a blank line (like Word's comments).
+
+    A comment whose words are already on the page is left out: a highlight
+    that copies the text it marks, or a stamp or cloud whose appearance
+    already drew its words. Repeated comments are written once.
+    """
+    if not comments:
+        return text
+    page_key = _comment_key(text)
+    page_words = " %s " % " ".join(re.findall(r"[^\W_]+", text.lower()))
+    added = []
+    seen = set()
+    for comment in comments:
+        key = _comment_key(comment)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if len(key) >= 8:
+            if key in page_key:
+                continue
+        elif " %s " % " ".join(re.findall(r"[^\W_]+", comment.lower())) in page_words:
+            continue        # a short comment counts as on the page only as whole words
+        added.append("[comment: %s]" % comment)
+    if not added:
+        return text
+    return "\n\n".join(([text] if text else []) + added)
 
 
 def _rect(value, resolve):
@@ -2586,17 +3171,20 @@ def _page_size(doc, page, attrs):
 # Title
 # --------------------------------------------------------------------------
 
-def _text_string(raw):
-    """A PDF text string (title, etc.) -> str."""
+def _raw_text_string(raw):
+    """A PDF text string -> str, line breaks kept."""
     if raw.startswith(b"\xfe\xff"):
-        text = raw[2:].decode("utf-16-be", "ignore")
-    elif raw.startswith(b"\xff\xfe"):
-        text = raw[2:].decode("utf-16-le", "ignore")
-    elif raw.startswith(b"\xef\xbb\xbf"):
-        text = raw[3:].decode("utf-8", "ignore")
-    else:
-        text = "".join(_PDF_DOC[b] for b in raw)
-    return " ".join(text.translate(_TIDY).split())
+        return raw[2:].decode("utf-16-be", "ignore")
+    if raw.startswith(b"\xff\xfe"):
+        return raw[2:].decode("utf-16-le", "ignore")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", "ignore")
+    return "".join(_PDF_DOC[b] for b in raw)
+
+
+def _text_string(raw):
+    """A PDF text string (title, etc.) -> str on one line."""
+    return " ".join(_raw_text_string(raw).translate(_TIDY).split())
 
 
 _XMP_TITLE_RE = re.compile(rb"<dc:title>(.*?)</dc:title>", re.S)
@@ -2628,30 +3216,38 @@ def _title(doc):
 # Entry point
 # --------------------------------------------------------------------------
 
-def extract_pdf(data=None, path=None, max_pages=300, time_budget=None):
+def extract_pdf(data=None, path=None, max_pages=300, time_budget=None, stop=None):
     """Read the text of a PDF. Never raises; a time budget keeps it from hanging.
 
     Give either ``data`` (bytes) or ``path``. ``max_pages`` 0 or None reads
-    every page; ``time_budget`` is in seconds (default TIME_BUDGET). Returns
-    a dict:
+    every page; ``time_budget`` is in seconds (default TIME_BUDGET). ``stop``
+    is an optional function asked before each page: when it returns True the
+    reading stops there (``stopped`` "cancelled"). Returns a dict:
 
     * ``pages``: text of each page read (at most ``max_pages``), lines joined
       with "\\n", a blank line between paragraphs/blocks and two spaces for a
-      wide gap on a line (table columns). Pages not reached because a limit
-      ran out are "";
+      wide gap on a line (table columns). Review comments typed into the
+      page's annotations (notes, clouds, highlights ...) come last, each as a
+      "[comment: ...]" line after a blank line. Pages not reached because a
+      limit ran out are "";
     * ``page_sizes``: (width, height) in points of the same pages, as shown
       (crop box, rotation applied);
     * ``page_count``: number of pages in the document;
     * ``title``: the document title property, "" if none;
-    * ``status``: "ok", "protected" (encrypted: no text, but page_count and
-      page_sizes are filled in when readable) or "error";
+    * ``status``: "ok", "protected" (encrypted and it cannot be decrypted:
+      no text, but page_count and page_sizes are filled in when readable) or
+      "error";
     * ``note``: a plain-English reason when the status is not "ok", or when
-      the text is incomplete (damaged file, time limit...); else "".
+      the text is incomplete (damaged file, time limit...); else "";
+    * ``pages_read``: how many of ``pages`` were read (the rest were not
+      reached because a budget ran out);
+    * ``stopped``: why reading stopped early: "time", "chars", "data" or
+      "objects" (a budget ran out) or "cancelled" (``stop``), else "".
 
     A scanned PDF without a text layer gives status "ok" and empty pages.
     """
     result = {"pages": [], "page_sizes": [], "page_count": 0, "title": "",
-              "status": "error", "note": ""}
+              "status": "error", "note": "", "pages_read": 0, "stopped": ""}
     seconds = TIME_BUDGET if time_budget is None else time_budget
     try:
         if data is None:
@@ -2665,10 +3261,12 @@ def extract_pdf(data=None, path=None, max_pages=300, time_budget=None):
         if len(data) > MAX_FILE_BYTES:
             result["note"] = "The PDF is too big to read (over %d MB)." % (MAX_FILE_BYTES // (1024 * 1024))
             return result
-        _extract(data, max_pages, seconds, result)
+        _extract(data, max_pages, seconds, result, stop)
     except _OutOfBudget as exc:
         result["status"] = "error"
         result["pages"] = []
+        result["pages_read"] = 0
+        result["stopped"] = exc.reason
         result["note"] = _budget_note(exc.reason, None, seconds)
     except OSError as exc:
         result["status"] = "error"
@@ -2684,6 +3282,8 @@ def extract_pdf(data=None, path=None, max_pages=300, time_budget=None):
 
 def _budget_note(reason, page, seconds):
     where = "" if page is None else "; pages from %d on were not read" % page
+    if reason == "cancelled":
+        return "Stopped (cancelled)%s." % where
     if reason == "time":
         return "Stopped after %g seconds (very complex PDF)%s." % (seconds, where)
     if reason == "chars":
@@ -2691,7 +3291,7 @@ def _budget_note(reason, page, seconds):
     return "The PDF is too large or complex to read in full%s." % where
 
 
-def _extract(data, max_pages, seconds, result):
+def _extract(data, max_pages, seconds, result, stop=None):
     limits = _Limits(seconds)
     if data.find(b"%PDF-", 0, 1024) < 0 and not _OBJ_SCAN_RE.search(data):
         result["note"] = "This is not a PDF file."
@@ -2712,7 +3312,10 @@ def _extract(data, max_pages, seconds, result):
     result["page_sizes"] = sizes
     if doc.encrypted:
         result["status"] = "protected"
-        result["note"] = "The PDF is encrypted (password-protected or locked), so its text cannot be read."
+        if doc.lock_reason == "password":
+            result["note"] = "The PDF is encrypted with a password needed to open it, so its text cannot be read."
+        else:
+            result["note"] = "The PDF is encrypted with a kind of security Squish cannot read."
         return
     if not pages:
         result["note"] = "No pages found (the PDF may be damaged)."
@@ -2726,6 +3329,10 @@ def _extract(data, max_pages, seconds, result):
     stopped_at = None
     for number, (page, attrs) in enumerate(pages[:count], 1):
         if stopped:
+            texts.append("")
+            continue
+        if stop is not None and stop():
+            stopped, stopped_at = "cancelled", number      # (this page was not read)
             texts.append("")
             continue
         try:
@@ -2745,6 +3352,10 @@ def _extract(data, max_pages, seconds, result):
             stopped = reader.stopped
             stopped_at = number + 1
     result["pages"] = texts
+    # The page where a budget ran out keeps the text read up to then; pages
+    # after it were not read (they are "").
+    result["pages_read"] = stopped_at - 1 if stopped else len(texts)
+    result["stopped"] = stopped or ""
     result["status"] = "ok"
     notes = []
     if doc.damaged:

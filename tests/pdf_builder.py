@@ -4,8 +4,9 @@ Enough of the PDF format (ISO 32000) to test the built-in PDF reader:
 pages of any size, text in the standard fonts (WinAnsi encoding), a
 Type0 / Identity-H font with a /ToUnicode map, compressed content streams,
 PDF 1.5 cross-reference streams and object streams, incremental updates,
-damaged cross-reference tables and an "encrypted" marker. All content is
-synthetic.
+damaged cross-reference tables, an "encrypted" marker and real encryption
+(RC4 40/128-bit, AES-128, AES-256, with an owner password and an empty or
+real user password). All content is synthetic.
 
 Quick use::
 
@@ -20,6 +21,7 @@ or, for full control::
 """
 
 import base64
+import hashlib
 import struct
 import zlib
 
@@ -228,8 +230,11 @@ def serialize(value):
     raise TypeError("cannot write %r" % (value,))
 
 
-def stream_bytes(stream):
+def stream_bytes(stream, crypt=None):
+    """A stream object's bytes; ``crypt(data)`` encrypts the encoded data."""
     data = stream.encoded()
+    if crypt is not None:
+        data = crypt(data)
     entries = dict(stream.entries)
     if stream.filters:
         names = [Name(f) for f in stream.filters]
@@ -267,12 +272,17 @@ class PdfWriter:
 
     def build(self, root, info=None, xref_stream=False, object_streams=False,
               encrypt=False, prefix=b"", break_xref=None, predictor=False,
-              trailer_extra=None, hybrid=False):
+              trailer_extra=None, hybrid=False, user_password=b"", owner_password=b"owner",
+              encrypt_metadata=True):
         """Write the whole file.
 
         root: Ref of the catalog. xref_stream: PDF 1.5 cross-reference stream
-        (always used with object_streams). encrypt: add an /Encrypt
-        dictionary (the content is NOT really encrypted). prefix: junk bytes
+        (always used with object_streams). encrypt: True adds an /Encrypt
+        dictionary but does NOT really encrypt (a marker whose password check
+        fails); "rc4-40", "rc4-128", "rc4-128-v4" (crypt filters), "aes-128",
+        "aes-256" (revision 6) or "aes-256-r5" really encrypt every string and
+        stream, with ``owner_password`` and ``user_password`` (empty: the file
+        opens without one). prefix: junk bytes
         before the "%PDF" header. break_xref: "offsets" (wrong offsets),
         "missing" (no xref table, trailer or startxref), "startxref"
         (startxref points nowhere). predictor: PNG predictor on the xref
@@ -284,7 +294,12 @@ class PdfWriter:
         trailer = {"Root": root}
         if info is not None:
             trailer["Info"] = info
-        if encrypt:
+        crypt = None
+        if isinstance(encrypt, str):
+            crypt = Encryptor(encrypt, user_password, owner_password, encrypt_metadata)
+            trailer["Encrypt"] = self.add(crypt.dictionary())
+            trailer["ID"] = [Raw(b"<" + crypt.file_id.hex().encode() + b">")] * 2
+        elif encrypt:
             trailer["Encrypt"] = self.add({
                 "Filter": Name("Standard"), "V": 1, "R": 2, "P": -44,
                 "O": Raw(b"<" + b"ab" * 32 + b">"), "U": Raw(b"<" + b"cd" * 32 + b">")})
@@ -316,7 +331,10 @@ class PdfWriter:
         for num in sorted(objects):
             offsets[num] = len(out)
             value = objects[num]
-            body = stream_bytes(value) if isinstance(value, Stream) else serialize(value)
+            if crypt is not None and num != trailer["Encrypt"].num:
+                body = crypt.object_bytes(num, value)
+            else:
+                body = stream_bytes(value) if isinstance(value, Stream) else serialize(value)
             out += b"%d 0 obj\n" % num + body + b"\nendobj\n"
         if break_xref == "missing":
             return bytes(out)
@@ -405,6 +423,207 @@ class PdfWriter:
             trailer["Info"] = info
         out += b"trailer\n" + serialize(trailer) + b"\nstartxref\n%d\n%%%%EOF\n" % start
         return bytes(out)
+
+
+# --------------------------------------------------------------------------
+# Real encryption (the standard security handler, ISO 32000-2 7.6)
+# --------------------------------------------------------------------------
+
+PASSWORD_PAD = bytes.fromhex("28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A")
+
+
+def rc4(key, data):
+    """RC4 (written out here so the tests do not rely on the reader's own copy)."""
+    s = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + s[i] + key[i % len(key)]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+    out = bytearray()
+    i = j = 0
+    for byte in data:
+        i = (i + 1) & 0xFF
+        j = (j + s[i]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+        out.append(byte ^ s[(s[i] + s[j]) & 0xFF])
+    return bytes(out)
+
+
+def aes_cbc_encrypt(key, iv, data):
+    """AES-CBC of whole blocks. The block cipher is the reader's (pdftext has
+    its own FIPS-197 known-answer tests); everything around it is written
+    here independently."""
+    from squish_app import pdftext
+    return pdftext._aes_cbc_encrypt(key, iv, data)
+
+
+def _padded(password):
+    return (password + PASSWORD_PAD)[:32]
+
+
+def _hash_r6(password, salt, user_key=b""):
+    """ISO 32000-2 algorithm 2.B (AES-256, revision 6)."""
+    k = hashlib.sha256(password + salt + user_key).digest()
+    i = 0
+    while True:
+        e = aes_cbc_encrypt(k[:16], k[16:32], (password + k + user_key) * 64)
+        k = [hashlib.sha256, hashlib.sha384, hashlib.sha512][int.from_bytes(e[:16], "big") % 3](e).digest()
+        i += 1
+        if i >= 64 and e[-1] <= i - 32:
+            return k[:32]
+
+
+class Encryptor:
+    """Encrypts a file's strings and streams like Acrobat's "restrict editing"."""
+
+    KINDS = {"rc4-40": (1, 2, 5), "rc4-128": (2, 3, 16), "rc4-128-v4": (4, 4, 16),
+             "aes-128": (4, 4, 16), "aes-256": (5, 6, 32), "aes-256-r5": (5, 5, 32)}
+
+    def __init__(self, kind, user_password=b"", owner_password=b"owner", encrypt_metadata=True):
+        self.kind = kind
+        self.v, self.r, self.size = self.KINDS[kind]
+        self.aes = kind.startswith("aes")
+        self.encrypt_metadata = encrypt_metadata
+        self.p = -3904                       # printing and copying not allowed
+        self.file_id = hashlib.md5(kind.encode() + user_password + owner_password).digest()
+        self.counter = 0
+        if self.v == 5:
+            self._aes256(user_password, owner_password)
+        else:
+            self._rc4_family(user_password, owner_password)
+
+    def _rc4_family(self, user, owner):
+        # Algorithm 3: the /O entry from the owner password.
+        key = hashlib.md5(_padded(owner)).digest()
+        if self.r >= 3:
+            for _ in range(50):
+                key = hashlib.md5(key[:self.size]).digest()
+        key = key[:self.size]
+        o = rc4(key, _padded(user))
+        if self.r >= 3:
+            for i in range(1, 20):
+                o = rc4(bytes(b ^ i for b in key), o)
+        self.o = o
+        # Algorithm 2: the file key from the user password.
+        digest = hashlib.md5(_padded(user) + o + struct.pack("<i", self.p) + self.file_id)
+        if self.r >= 4 and not self.encrypt_metadata:
+            digest.update(b"\xff" * 4)
+        key = digest.digest()
+        if self.r >= 3:
+            for _ in range(50):
+                key = hashlib.md5(key[:self.size]).digest()
+        self.key = key[:self.size]
+        # Algorithms 4 and 5: the /U entry.
+        if self.r == 2:
+            self.u = rc4(self.key, PASSWORD_PAD)
+        else:
+            u = rc4(self.key, hashlib.md5(PASSWORD_PAD + self.file_id).digest())
+            for i in range(1, 20):
+                u = rc4(bytes(b ^ i for b in self.key), u)
+            self.u = u + bytes(16)
+
+    def _aes256(self, user, owner):
+        if self.r == 5:
+            hash_ = lambda pw, salt, extra=b"": hashlib.sha256(pw + salt + extra).digest()
+        else:
+            hash_ = _hash_r6
+        self.key = hashlib.sha256(b"file key" + self.file_id).digest()
+        salts = hashlib.sha512(self.file_id).digest()
+        self.u = hash_(user, salts[0:8]) + salts[0:8] + salts[8:16]
+        self.ue = aes_cbc_encrypt(hash_(user, salts[8:16]), bytes(16), self.key)
+        self.o = hash_(owner, salts[16:24], self.u) + salts[16:24] + salts[24:32]
+        self.oe = aes_cbc_encrypt(hash_(owner, salts[24:32], self.u), bytes(16), self.key)
+        perms = struct.pack("<i", self.p) + b"\xff\xff\xff\xff" + (b"T" if self.encrypt_metadata else b"F") + b"adb" + bytes(4)
+        self.perms = aes_cbc_encrypt(self.key, bytes(16), perms)       # (one block: ECB)
+
+    def dictionary(self):
+        """The /Encrypt dictionary."""
+        hexed = lambda data: Raw(b"<" + data.hex().encode() + b">")
+        enc = {"Filter": Name("Standard"), "V": self.v, "R": self.r, "P": self.p,
+               "O": hexed(self.o), "U": hexed(self.u)}
+        if self.v == 2:
+            enc["Length"] = self.size * 8
+        if self.v >= 4:
+            cfm = {"rc4-128-v4": "V2", "aes-128": "AESV2"}.get(self.kind, "AESV3")
+            enc["CF"] = {"StdCF": {"CFM": Name(cfm), "Length": self.size, "AuthEvent": Name("DocOpen")}}
+            enc["StmF"] = enc["StrF"] = Name("StdCF")
+            enc["Length"] = self.size * 8
+            if not self.encrypt_metadata:
+                enc["EncryptMetadata"] = False
+        if self.v == 5:
+            enc["UE"], enc["OE"], enc["Perms"] = hexed(self.ue), hexed(self.oe), hexed(self.perms)
+        return enc
+
+    def encrypt(self, num, data):
+        """Encrypt one string or stream of object ``num`` (generation 0)."""
+        if self.v == 5:
+            key = self.key
+        else:
+            key = hashlib.md5(self.key + struct.pack("<i", num)[:3] + b"\x00\x00"
+                              + (b"sAlT" if self.aes else b"")).digest()[:min(self.size + 5, 16)]
+        if not self.aes:
+            return rc4(key, data)
+        self.counter += 1
+        iv = hashlib.md5(b"iv %d %d" % (num, self.counter)).digest()
+        pad = 16 - len(data) % 16
+        return iv + aes_cbc_encrypt(key, iv, data + bytes((pad,)) * pad)
+
+    def value(self, num, value):
+        """A value with its strings encrypted (written as hex strings)."""
+        if isinstance(value, Raw):
+            raw = bytes(value)
+            if raw[:1] == b"(" or (raw[:1] == b"<" and raw[:2] != b"<<"):
+                return Raw(b"<" + self.encrypt(num, _string_bytes(raw)).hex().encode() + b">")
+            return value
+        if isinstance(value, (Name, Ref)) or value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return self.value(num, text_string(value))
+        if isinstance(value, bytes):
+            return Raw(b"<" + self.encrypt(num, value).hex().encode() + b">")
+        if isinstance(value, (list, tuple)):
+            return [self.value(num, v) for v in value]
+        if isinstance(value, dict):
+            return dict((k, self.value(num, v)) for k, v in value.items())
+        return value
+
+    def object_bytes(self, num, value):
+        """The body of object ``num``, encrypted."""
+        if isinstance(value, Stream):
+            if value.entries.get("Type") == "XRef":
+                return stream_bytes(value)
+            plain_metadata = value.entries.get("Type") == "Metadata" and not self.encrypt_metadata
+            copy = Stream(value.data, self.value(num, value.entries), value.filters, value.parms, value.length)
+            return stream_bytes(copy, None if plain_metadata else (lambda data: self.encrypt(num, data)))
+        return serialize(self.value(num, value))
+
+
+def _string_bytes(raw):
+    """The bytes of a string written as "(...)" or "<...>"."""
+    if raw[:1] == b"<":
+        digits = bytes(c for c in raw[1:-1] if c not in b" \n\r\t")
+        return bytes.fromhex(digits.decode() + ("0" if len(digits) % 2 else ""))
+    out = bytearray()
+    body = raw[1:-1]
+    i = 0
+    while i < len(body):
+        c = body[i]
+        if c == 0x5C and i + 1 < len(body):
+            nxt = body[i + 1:i + 2]
+            if nxt.isdigit():
+                digits = body[i + 1:i + 4]
+                n = 0
+                while n < len(digits) and 0x30 <= digits[n] <= 0x37:
+                    n += 1
+                out.append(int(digits[:n], 8) & 0xFF)
+                i += 1 + n
+                continue
+            out += {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f"}.get(nxt, nxt)
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return bytes(out)
 
 
 def _png_up(data, columns):
@@ -618,3 +837,51 @@ def simple_pdf(pages, title=None, font="Helvetica", size=A4, **build_options):
     root = writer.add(catalog(writer, page_dicts))
     info = writer.add({"Title": title, "Producer": "squish tests"}) if title is not None else None
     return writer.build(root, info=info, **build_options)
+
+
+def markup_pdf(body=("Shop drawing SD-104 Rev 0", "Base plate BP1 25 mm thick, 4 x M24 bolts.")):
+    """A page sent back from review (as Bluebeam or Acrobat write it): a stamp
+    drawn by its appearance, a sticky note, clouds, typed text without an
+    appearance, a highlight copying the page text, a reply, plus annotations
+    that hold no comment (a pop-up, a link, a review-status entry, a hidden note).
+    All synthetic."""
+    w = PdfWriter()
+    font = w.add(standard_font("Helvetica"))
+    stamp = w.add(Stream(b"BT /Helv 14 Tf 4 6 Td (REVISE AND RESUBMIT) Tj ET",
+                         {"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": [0, 0, 200, 30],
+                          "Resources": {"Font": {"Helv": font}}}))
+    note = w.add({"Type": Name("Annot"), "Subtype": Name("Text"), "Rect": [500, 700, 520, 720],
+                  "Contents": b"Anchor bolt embedment to be 450 mm, not 300 mm"})
+
+    def annot(subtype, contents=None, **extra):
+        entry = {"Type": Name("Annot"), "Subtype": Name(subtype), "Rect": [100, 300, 300, 330]}
+        if contents is not None:
+            entry["Contents"] = contents
+        entry.update(extra)
+        return w.add(entry)
+    annots = [
+        note,
+        annot("Square", b"Plate thickness to be 32 mm per calc C-07"),
+        annot("Stamp", b"Revise and resubmit", AP={"N": stamp}),
+        annot("FreeText", b"Grout 40 mm non-shrink", DA=b"/Helv 10 Tf 0 g"),
+        annot("Highlight", body[1].encode("latin-1")),             # copies the page text
+        annot("Popup", b"Anchor bolt embedment to be 450 mm, not 300 mm", Parent=note),
+        annot("Link", b"Not a comment"),
+        annot("Text", b"Accepted set by Sam Brown", IRT=note, StateModel=b"Review", State=b"Accepted"),
+        annot("Text", b"Hidden reviewer note", F=2),
+        annot("Polygon", text_string("Add shear key \u2013 see SK-02")),
+        annot("Text", b"Agreed, revise", IRT=note),                  # a reply is a comment
+        annot("Square", b"Plate thickness to be 32 mm per calc C-07"),   # the same comment twice
+    ]
+    lines = [b"BT /F1 12 Tf 72 %d Td " % (760 - 20 * i) + serialize(win_ansi(line)) + b" Tj ET"
+             for i, line in enumerate(body)]
+    page = page_dict(w, b"\n".join(lines), {"F1": font}, extra={"Annots": annots})
+    return w.build(w.add(catalog(w, [page])))
+
+
+MARKUP_COMMENTS = [
+    "[comment: Anchor bolt embedment to be 450 mm, not 300 mm]",
+    "[comment: Plate thickness to be 32 mm per calc C-07]",
+    "[comment: Grout 40 mm non-shrink]",
+    "[comment: Add shear key \u2013 see SK-02]",
+    "[comment: Agreed, revise]"]

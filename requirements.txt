@@ -5,3 +5,6 @@
 extract-msg
 # pypdf: reads the text of PDF documents (attachments and the documents folder) better.
 pypdf
+# cryptography: optional; lets pypdf read AES-secured PDFs (Squish's built-in reader opens
+# those that need no password without it).
+cryptography

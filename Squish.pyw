@@ -1,7 +1,7 @@
 """Double-click this file to start Squish.
 
-Squish turns a folder of filed Outlook emails into one compact text file you
-can drag into Claude. See README.md.
+Squish turns a folder of filed Outlook emails, and their documents, into
+compact text files you can drag into Claude. See README.md.
 
     Squish.pyw                      open the Squish window
     Squish.pyw run "Project name"   run a saved project without the window
