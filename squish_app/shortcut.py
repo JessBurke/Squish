@@ -33,6 +33,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 from . import paths
 
@@ -552,9 +553,10 @@ def tell_explorer(lnk_path):
         shell32.SHChangeNotify.restype = None
         path = ctypes.c_wchar_p(lnk_path)
         folder = ctypes.c_wchar_p(os.path.dirname(lnk_path))
-        # SHCNE_CREATE / SHCNE_UPDATEDIR with SHCNF_PATHW | SHCNF_FLUSH
-        shell32.SHChangeNotify(0x00000002, 0x1005, ctypes.cast(path, ctypes.c_void_p), None)
-        shell32.SHChangeNotify(0x00001000, 0x1005, ctypes.cast(folder, ctypes.c_void_p), None)
+        # SHCNE_CREATE / SHCNE_UPDATEDIR with SHCNF_PATHW | SHCNF_FLUSHNOWAIT
+        # (FLUSHNOWAIT, so a busy or hung Explorer can't hold the helper up)
+        shell32.SHChangeNotify(0x00000002, 0x2005, ctypes.cast(path, ctypes.c_void_p), None)
+        shell32.SHChangeNotify(0x00001000, 0x2005, ctypes.cast(folder, ctypes.c_void_p), None)
     except Exception:
         pass
 
@@ -621,23 +623,56 @@ def create_shortcut(where=DESKTOP, app_dir=None):
         ("PowerShell", lambda: _run(powershell_command(), env)),
         ("Windows Script Host", lambda: _run_vbs(env)),
     ]
+    expected = expected_shortcut_path(folder_key)
     problems = []
     for name, attempt in attempts:
+        started = time.time()
         ok, detail = attempt()
         if ok and not shortcut_exists(detail):
-            ok, detail = False, "it reported success, but no shortcut appeared at %s" % detail
+            # The reported path may have come back in another code page (cscript
+            # writes in the console's), so also look where the shortcut should be.
+            if expected and shortcut_exists(expected, newer_than=started - 2):
+                detail = expected
+            else:
+                ok, detail = False, "it reported success, but no shortcut appeared at %s" % detail
         if ok:
             return True, "%s shortcut created:\n%s" % (label, detail)
         problems.append((name, detail))
     return False, failure_message(label, problems)
 
 
-def shortcut_exists(path):
-    """True if the shortcut a helper reported is really there."""
+def shortcut_exists(path, newer_than=None):
+    """True if the shortcut a helper reported is really there (and, with
+    ``newer_than``, was written at or after that time)."""
     try:
-        return bool(path) and os.path.isfile(path)
+        if not path or not os.path.isfile(path):
+            return False
+        return newer_than is None or os.path.getmtime(path) >= newer_than
     except (OSError, ValueError):
         return False
+
+
+def expected_shortcut_path(folder_key):
+    """Where Squish.lnk should end up for DESKTOP / START_MENU, or None.
+
+    Asks Windows with SHGetFolderPathW (a plain function call, no COM), so it
+    follows a OneDrive-redirected Desktop just like the helpers do.
+    """
+    if not is_windows() or folder_key not in CSIDL_FOLDERS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        buffer = ctypes.create_unicode_buffer(1024)
+        function = ctypes.windll.shell32.SHGetFolderPathW
+        function.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.HANDLE, wintypes.DWORD,
+                             wintypes.LPWSTR]
+        function.restype = ctypes.c_long
+        if function(None, CSIDL_FOLDERS[folder_key], None, 0, buffer) != 0 or not buffer.value:
+            return None
+        return os.path.join(buffer.value, SHORTCUT_NAME)
+    except Exception:
+        return None
 
 
 def failure_message(label, problems):

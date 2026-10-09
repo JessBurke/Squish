@@ -55,6 +55,7 @@ rem Microsoft Store placeholder, which fails with an error instead of running.
 set "PY="
 set "PYW="
 set "COPYFAILED="
+set "INPLACE="
 py -3 -c "import sys" >nul 2>&1
 if errorlevel 1 goto :trypython
 set "PY=py -3"
@@ -124,19 +125,26 @@ rem Skipped when this installer is already running from there. "%~dp0." (with
 rem the dot) stops robocopy reading the folder's last backslash as an escape.
 :copyapp
 echo.
-if /i "%~dp0"=="%DEST%\" goto :installed
+if /i "%~dp0"=="%DEST%\" set "INPLACE=1"
+if defined INPLACE goto :installed
 echo  Copying Squish to "%DEST%" ...
 if not exist "%DEST%\" mkdir "%DEST%" >nul 2>&1
-rem robocopy /MIR also removes files an older Squish had that this one doesn't.
-rem If robocopy is missing or fails (exit code 8 or more), xcopy is tried.
+rem The top level is copied without deleting anything already there; only
+rem Squish's own code folders are mirrored, so files an older Squish had are
+rem removed from them. If robocopy is missing or fails (exit code 8 or more),
+rem xcopy is tried.
 where robocopy >nul 2>&1
 if errorlevel 1 goto :xcopy
-robocopy "%~dp0." "%DEST%" /MIR /XD __pycache__ .git /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >"%TEMP%\squish-copy-log.txt" 2>&1
+robocopy "%~dp0." "%DEST%" /E /XD __pycache__ .git /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >"%TEMP%\squish-copy-log.txt" 2>&1
+if errorlevel 8 goto :xcopy
+robocopy "%~dp0squish_app" "%DEST%\squish_app" /MIR /XD __pycache__ /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >>"%TEMP%\squish-copy-log.txt" 2>&1
+if errorlevel 8 goto :xcopy
+robocopy "%~dp0assets" "%DEST%\assets" /MIR /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >>"%TEMP%\squish-copy-log.txt" 2>&1
 if errorlevel 8 goto :xcopy
 goto :checkcopy
 
 :xcopy
-xcopy "%~dp0*" "%DEST%\" /E /I /Y /Q >>"%TEMP%\squish-copy-log.txt" 2>&1
+xcopy "%~dp0*" "%DEST%\" /E /I /Y /Q /R >>"%TEMP%\squish-copy-log.txt" 2>&1
 if errorlevel 1 goto :copyfailed
 goto :checkcopy
 
@@ -149,15 +157,26 @@ echo  Copied.
 rem ---- 4. Shortcuts ---------------------------------------------------------
 echo.
 echo  Creating the shortcuts...
-%PY% "%DEST%\Squish.pyw" --create-shortcuts --console >"%TEMP%\squish-shortcut-log.txt" 2>&1
-set "SHORTCUTRESULT=%errorlevel%"
-type "%TEMP%\squish-shortcut-log.txt"
-if not "%SHORTCUTRESULT%"=="0" goto :shortcutproblem
+rem Exit code 0: both shortcuts made; 2: only the Start Menu one failed;
+rem 1: the Desktop shortcut failed.
+%PY% "%DEST%\Squish.pyw" --create-shortcuts --console
+if errorlevel 2 goto :startmenuproblem
+if errorlevel 1 goto :shortcutproblem
 echo.
 echo  All done! Squish is on your Desktop and in the Start Menu
 echo  (search for Squish in the Start Menu if you can't see the Desktop icon).
+goto :donetext
+
+:startmenuproblem
 echo.
-if "%COPYFAILED%"=="1" goto :offerlaunch
+echo  Squish is on your Desktop. (The Start Menu shortcut couldn't be made -
+echo  see the message above. The Desktop one is all you need.)
+goto :donetext
+
+:donetext
+echo.
+if defined COPYFAILED goto :offerlaunch
+if defined INPLACE goto :offerlaunch
 echo  Squish is installed in: "%DEST%"
 echo  You can delete the folder you downloaded. To update Squish later, download
 echo  the new version and run "Install Squish.bat" again - your projects are kept.
@@ -165,9 +184,9 @@ goto :offerlaunch
 
 :shortcutproblem
 echo.
-echo  The shortcuts couldn't be made automatically (see the message above).
-echo  Squish itself is installed - you can start it by double-clicking
-echo  Squish.pyw in this folder (opening now):
+echo  The Desktop shortcut couldn't be made automatically (see the message above).
+echo  You can start Squish by double-clicking Squish.pyw in this folder
+echo  (opening now):
 echo    "%DEST%"
 echo  To make a Desktop shortcut yourself: right-click Squish.pyw there, choose
 echo  "Show more options" (Windows 11), then Send to, then Desktop (create shortcut).

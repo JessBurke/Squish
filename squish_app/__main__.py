@@ -129,7 +129,17 @@ def create_shortcuts(console):
         say("\n".join("  " + line for line in text.splitlines()))
     else:
         show_message("Squish shortcuts", text, error=not ok)
-    return 0 if ok else 1
+    return shortcuts_exit_code(results)
+
+
+def shortcuts_exit_code(results):
+    """0 if every shortcut was made, 2 if only the Start Menu one failed (the
+    Desktop one, which matters most, was made), else 1. The installer uses it."""
+    if all(ok for ok, _ in results):
+        return 0
+    if len(results) > 1 and results[0][0]:
+        return 2
+    return 1
 
 
 def start_gui():

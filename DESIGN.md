@@ -768,13 +768,22 @@ replaced by its app alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`.
 The native way was tested under Wine with Windows Python 3.12 (Wine doesn't store the app ID).
 
 **Installer.** `Install Squish.bat` copies the unzipped folder to
-`%LOCALAPPDATA%\Programs\Squish` (robocopy `/MIR`, skipping `__pycache__`; xcopy if robocopy
-is missing or fails), then makes the shortcuts for that copy, so it doesn't matter where the
+`%LOCALAPPDATA%\Programs\Squish` (robocopy `/E` for the top level, which never deletes
+anything already there, and `/MIR` only for Squish's own `squish_app` and `assets` folders,
+skipping `__pycache__`; xcopy if robocopy is missing or fails), then makes the shortcuts for
+that copy, so it doesn't matter where the
 download was unzipped (Downloads included) and the download can be deleted. Running it again
 updates Squish; projects and settings live in `%APPDATA%\Squish` and caches in
 `%LOCALAPPDATA%\Squish`, which it never touches. If the copy fails, the shortcuts point at
-the unzipped folder instead and the installer says not to delete it. When the shortcuts
-can't be made, it says so and opens the installed folder in Explorer.
+the unzipped folder instead and the installer says not to delete it. `Squish.pyw --create-shortcuts`
+exits 0 when both shortcuts were made, 2 when only the Start Menu one failed (the installer
+then says the Desktop one is there) and 1 when the Desktop one failed (the installer says so
+and opens the installed folder in Explorer). Its output goes straight to the console, so
+non-ASCII paths show correctly. Run again from the installed copy, it skips the copy and
+doesn't say the download can be deleted. Explorer is told about a new shortcut with
+`SHCNF_FLUSHNOWAIT`. A helper's reported path is checked; if it isn't there (cscript writes
+in the console code page), the expected path from `SHGetFolderPathW` counts when that file was
+written during the attempt.
 Non-Windows: `(False, "Desktop shortcuts are only created on Windows")`.
 
 ## Documents (v1.1): condensing Word, Excel, PowerPoint and PDF files

@@ -48,7 +48,12 @@ You can set up as many projects as you like; Squish remembers each one.
    delete the downloaded zip and folder.
 
 **Updating Squish:** download the new version, unzip it and run
-`Install Squish.bat` again. Your projects and settings are kept.
+`Install Squish.bat` again. Your projects and settings are kept. (A copy of the
+installer is also kept with Squish, in `%LOCALAPPDATA%\Programs\Squish` - paste
+that into File Explorer's address bar to find it.)
+
+Double-click the installer normally - don't use *Run as administrator* with an IT
+account, or the shortcuts end up on that account's Desktop instead of yours.
 
 ### If Python isn't installed
 

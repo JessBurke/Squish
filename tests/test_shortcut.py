@@ -341,6 +341,50 @@ class CreateShortcutTests(unittest.TestCase):
         self.assertTrue(results[1][1].startswith("Start Menu"))
 
 
+class ShortcutCheckTests(unittest.TestCase):
+    def test_reported_path_in_wrong_code_page_still_counts(self):
+        import tempfile
+        import time
+        folder = tempfile.mkdtemp()
+        real = os.path.join(folder, "Squish.lnk")
+        calls = []
+
+        def run(command, env):
+            calls.append(command)
+            with open(real, "wb") as fh:          # the helper really made it...
+                fh.write(b"L")
+            return True, real.replace("Squish", "Sq\ufffduish")   # ...but the path came back garbled
+        with mock.patch.object(shortcut, "is_windows", return_value=True), \
+                mock.patch.object(shortcut, "_run", side_effect=run), \
+                mock.patch.object(shortcut, "expected_shortcut_path", return_value=real):
+            ok, message = shortcut.create_desktop_shortcut(app_dir=r"C:\S")
+        self.assertTrue(ok)
+        self.assertIn(real, message)
+        self.assertEqual(len(calls), 1)
+
+    def test_old_leftover_shortcut_does_not_count(self):
+        import tempfile
+        folder = tempfile.mkdtemp()
+        old = os.path.join(folder, "Squish.lnk")
+        with open(old, "wb") as fh:
+            fh.write(b"L")
+        os.utime(old, (1000000000, 1000000000))
+        with mock.patch.object(shortcut, "is_windows", return_value=True), \
+                mock.patch.object(shortcut, "_run", return_value=(True, r"C:\gone\Squish.lnk")), \
+                mock.patch.object(shortcut, "_run_vbs", return_value=(False, "blocked")), \
+                mock.patch.object(shortcut, "expected_shortcut_path", return_value=old):
+            ok, message = shortcut.create_desktop_shortcut(app_dir=r"C:\S")
+        self.assertFalse(ok)
+        self.assertIn("no shortcut appeared", message)
+
+    def test_exit_codes_for_the_installer(self):
+        from squish_app import __main__ as launcher
+        self.assertEqual(launcher.shortcuts_exit_code([(True, "d"), (True, "s")]), 0)
+        self.assertEqual(launcher.shortcuts_exit_code([(True, "d"), (False, "s")]), 2)
+        self.assertEqual(launcher.shortcuts_exit_code([(False, "d"), (True, "s")]), 1)
+        self.assertEqual(launcher.shortcuts_exit_code([(False, "not Windows")]), 1)
+
+
 class NativeHelperTests(unittest.TestCase):
     def test_console_python(self):
         exe = r"C:\Py\pythonw.exe"
