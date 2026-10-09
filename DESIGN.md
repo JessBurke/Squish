@@ -36,7 +36,7 @@ squish/
   assets/                 squish.ico, squish.png (256), squish-64.png + squish-32.png (window
                           icon and header), squish.svg (+ make_icon.py, dev only, needs Pillow)
   squish_app/
-    __init__.py           __version__ ("1.1.0": shown in the status bar, Help > About, --version)
+    __init__.py           __version__ ("1.1.1": shown in the status bar, Help > About, --version)
     __main__.py           launcher logic (argument handling, GUI crash report + crash log)
     paths.py              data/cache/log/output folders, output_name(), clean_folder_text(), long_path()
     readers.py            read_email(path) -> EmailRecord ; .msg (extract-msg or built-in) and .eml
