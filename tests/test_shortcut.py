@@ -255,53 +255,132 @@ class CreateShortcutTests(unittest.TestCase):
             return outcomes.pop(0)
         return run
 
-    def test_powershell_success(self):
+    def _patched(self, run):
+        """Patch Windows detection, the helper runner and the 'shortcut exists' check."""
+        return (mock.patch.object(shortcut, "is_windows", return_value=True),
+                mock.patch.object(shortcut, "_run", side_effect=run),
+                mock.patch.object(shortcut, "shortcut_exists", return_value=True))
+
+    def test_native_api_first(self):
         calls = []
         run = self._fake_run([(True, r"C:\Users\x\OneDrive\Desktop\Squish.lnk")], calls)
-        with mock.patch.object(shortcut, "is_windows", return_value=True), \
-                mock.patch.object(shortcut, "_run", side_effect=run):
+        a, b, c = self._patched(run)
+        with a, b, c:
             ok, message = shortcut.create_desktop_shortcut(app_dir=NASTY_DIRS[0])
         self.assertTrue(ok)
         self.assertIn(r"OneDrive\Desktop\Squish.lnk", message)
         self.assertEqual(len(calls), 1)
         command, env = calls[0]
-        self.assertIn("-Command", command)
+        self.assertEqual(command[1:3], ["-I", "-c"])
+        self.assertEqual(command[3], shortcut.NATIVE_BOOTSTRAP)
         self.assertEqual(env["SQUISH_SC_FOLDER"], "Desktop")
         self.assertEqual(env["SQUISH_SC_WORKDIR"], NASTY_DIRS[0])
+        self.assertEqual(env["SQUISH_SC_APPDIR"], NASTY_DIRS[0])
+
+    def test_falls_back_to_powershell(self):
+        calls = []
+        run = self._fake_run([(False, "exit code 3221225477"),
+                              (True, r"C:\Users\x\Desktop\Squish.lnk")], calls)
+        a, b, c = self._patched(run)
+        with a, b, c:
+            ok, message = shortcut.create_desktop_shortcut(app_dir=NASTY_DIRS[2])
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("-Command", calls[1][0])
 
     def test_falls_back_to_vbscript(self):
         calls = []
-        run = self._fake_run([(False, "Cannot create type. Only core types are supported"),
+        run = self._fake_run([(False, "blocked"),
+                              (False, "Cannot create type. Only core types are supported"),
                               (True, r"C:\Users\x\AppData\Roaming\Microsoft\Windows\Start Menu"
                                      r"\Programs\Squish.lnk")], calls)
-        with mock.patch.object(shortcut, "is_windows", return_value=True), \
-                mock.patch.object(shortcut, "_run", side_effect=run):
+        a, b, c = self._patched(run)
+        with a, b, c:
             ok, message = shortcut.create_start_menu_shortcut(app_dir=NASTY_DIRS[1])
         self.assertTrue(ok)
         self.assertTrue(message.startswith("Start Menu shortcut created"))
-        self.assertEqual(len(calls), 2)
-        vbs_command, env = calls[1]
+        self.assertEqual(len(calls), 3)
+        vbs_command, env = calls[2]
         self.assertTrue(vbs_command[-1].endswith(".vbs"))
         self.assertFalse(os.path.exists(vbs_command[-1]), "temporary script should be removed")
         self.assertEqual(env["SQUISH_SC_FOLDER"], "Programs")
 
-    def test_both_fail_gives_clear_message(self):
+    def test_all_fail_gives_clear_message(self):
         calls = []
-        run = self._fake_run([(False, "blocked by policy"), (False, "it could not be started")], calls)
-        with mock.patch.object(shortcut, "is_windows", return_value=True), \
-                mock.patch.object(shortcut, "_run", side_effect=run):
+        run = self._fake_run([(False, "access violation"), (False, "blocked by policy"),
+                              (False, "it could not be started")], calls)
+        a, b, c = self._patched(run)
+        with a, b, c:
             ok, message = shortcut.create_desktop_shortcut(app_dir=r"C:\S")
         self.assertFalse(ok)
-        self.assertIn("blocked by policy", message)
-        self.assertIn("Send to > Desktop (create shortcut)", message)
+        for text in ("Windows shortcut API: access violation", "PowerShell: blocked by policy",
+                     "Windows Script Host: it could not be started",
+                     "Send to > Desktop (create shortcut)"):
+            self.assertIn(text, message)
+
+    def test_success_without_a_file_is_not_trusted(self):
+        calls = []
+        run = self._fake_run([(True, r"C:\nowhere\Squish.lnk"), (True, r"C:\x\Squish.lnk"),
+                              (False, "no")], calls)
+        with mock.patch.object(shortcut, "is_windows", return_value=True), \
+                mock.patch.object(shortcut, "_run", side_effect=run), \
+                mock.patch.object(shortcut, "shortcut_exists",
+                                  side_effect=lambda p: p == r"C:\x\Squish.lnk"):
+            ok, message = shortcut.create_desktop_shortcut(app_dir=r"C:\S")
+        self.assertTrue(ok)
+        self.assertIn(r"C:\x\Squish.lnk", message)
+        self.assertEqual(len(calls), 2)
 
     def test_all_shortcuts_on_windows(self):
         with mock.patch.object(shortcut, "is_windows", return_value=True), \
-                mock.patch.object(shortcut, "_run", return_value=(True, "X:\\Squish.lnk")):
+                mock.patch.object(shortcut, "_run", return_value=(True, "X:\\Squish.lnk")), \
+                mock.patch.object(shortcut, "shortcut_exists", return_value=True):
             results = shortcut.create_all_shortcuts(app_dir=r"C:\S")
         self.assertEqual([ok for ok, _ in results], [True, True])
         self.assertTrue(results[0][1].startswith("Desktop"))
         self.assertTrue(results[1][1].startswith("Start Menu"))
+
+
+class NativeHelperTests(unittest.TestCase):
+    def test_console_python(self):
+        exe = r"C:\Py\pythonw.exe"
+        self.assertEqual(shortcut.console_python(exe, exists_in(r"C:\Py\python.exe")),
+                         r"C:\Py\python.exe")
+        self.assertEqual(shortcut.console_python(exe, exists_in()), exe)
+        self.assertEqual(shortcut.console_python(r"C:\Py\python.exe", exists_in()),
+                         r"C:\Py\python.exe")
+        self.assertEqual(shortcut.console_python(r"C:\Py\pythonw3.12.exe",
+                                                 exists_in(r"C:\Py\python3.12.exe")),
+                         r"C:\Py\python3.12.exe")
+        self.assertEqual(shortcut.console_python(""), "")
+
+    def test_native_command_has_no_paths_pasted_in(self):
+        command = shortcut.native_command(r"C:\Users\Sam O'Brien\Py\python.exe")
+        self.assertEqual(command[0], r"C:\Users\Sam O'Brien\Py\python.exe")
+        self.assertNotIn("O'Brien", command[3])
+        self.assertIn("SQUISH_SC_APPDIR", command[3])
+        compile(command[3], "<bootstrap>", "exec")
+
+    def test_split_icon_location(self):
+        self.assertEqual(shortcut.split_icon_location(r"C:\a,b\squish.ico,0"),
+                         (r"C:\a,b\squish.ico", 0))
+        self.assertEqual(shortcut.split_icon_location(r"C:\x\squish.ico"), (r"C:\x\squish.ico", 0))
+        self.assertEqual(shortcut.split_icon_location(""), ("", 0))
+
+    def test_native_main_reports_failure_off_windows(self):
+        env = {"SQUISH_SC_FOLDER": "Desktop"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(shortcut, "_emit") as emit:
+            code = shortcut.native_main()
+        if os.name == "nt":
+            self.skipTest("would really make a shortcut")
+        self.assertEqual(code, 1)
+        self.assertTrue(emit.call_args[0][0].startswith("FAILED "))
+
+    def test_unknown_folder_rejected(self):
+        with mock.patch.dict(os.environ, {"SQUISH_SC_FOLDER": "Startup"}), \
+                mock.patch.object(shortcut, "_emit") as emit:
+            self.assertEqual(shortcut.native_main(), 1)
+        self.assertIn("unknown folder", emit.call_args[0][0])
 
 
 if __name__ == "__main__":

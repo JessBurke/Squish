@@ -28,7 +28,8 @@ This document is the contract between the modules. Change it deliberately.
 squish/
   Squish.pyw              launcher: no args -> GUI; "--create-shortcuts" -> shortcuts; "run ..." -> CLI
                           (thin wrapper around squish_app/__main__.py; "python -m squish_app" is the same)
-  Install Squish.bat      Windows installer: optional pip install, creates Desktop + Start Menu shortcuts
+  Install Squish.bat      Windows installer: optional pip installs, copies Squish to
+                          %LOCALAPPDATA%\Programs\Squish, creates Desktop + Start Menu shortcuts
   requirements.txt        extract-msg, pypdf, cryptography (all optional)
   README.md               user guide
   DESIGN.md               this file
@@ -742,15 +743,38 @@ set so the taskbar shows the Squish icon.
 
 `create_desktop_shortcut()` / `create_start_menu_shortcut()` -> `(ok, message)`. Makes
 `Squish.lnk` (target: the `pythonw.exe` next to `sys.executable`, or the Microsoft Store
-alias; arguments: the quoted path of `Squish.pyw`; icon `assets/squish.ico`). The folder comes
-from `[Environment]::GetFolderPath('Desktop'|'Programs')` so a OneDrive Desktop works.
-Windows PowerShell + `WScript.Shell` first; if that is blocked (Constrained Language Mode), a
-temporary VBScript run by `cscript`. Values are passed only in `SQUISH_SC_*` environment
-variables, never pasted into script text. The PowerShell way also writes the taskbar app ID
-(`paths.APP_ID`, `Squish.EmailDigest`) onto `Squish.lnk` with a small C# helper compiled by
-`Add-Type` (passed in `SQUISH_SC_APPID` / `SQUISH_SC_CS`); if that fails the shortcut still
-works, and the VBScript fallback can't set it. A Microsoft Store Python's `pythonw.exe` under
-`Program Files\WindowsApps` is replaced by its app alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`.
+alias; arguments: the quoted path of `Squish.pyw`; icon `assets/squish.ico`). Three ways are
+tried in turn, and a way only counts as working when the reported `.lnk` file exists:
+
+1. **Windows' shortcut API** (`IShellLinkW` + `IPersistFile`, plus `IPropertyStore` for the
+   taskbar app ID `paths.APP_ID`), called with ctypes in a helper process
+   (`native_command()`: the console `python.exe` next to `pythonw.exe`, `-I -c`
+   `NATIVE_BOOTSTRAP`, which imports Squish from `SQUISH_SC_APPDIR` and runs
+   `native_main()`), so a crash there can never take Squish down. The folder comes from
+   `SHGetFolderPathW` (`CSIDL_DESKTOPDIRECTORY` / `CSIDL_PROGRAMS`, so a OneDrive Desktop
+   works), and `SHChangeNotify` makes Explorer show the new icon at once. It needs no
+   PowerShell or Windows Script Host, so Constrained Language Mode and AppLocker script rules
+   don't stop it.
+2. **Windows PowerShell** + `WScript.Shell`, folder from
+   `[Environment]::GetFolderPath('Desktop'|'Programs')`; it also writes the app ID with a small
+   C# helper compiled by `Add-Type` (`SQUISH_SC_APPID` / `SQUISH_SC_CS`); if that fails the
+   shortcut still works.
+3. A temporary **VBScript** run by `cscript` (can't set the app ID).
+
+Values are passed only in `SQUISH_SC_*` environment variables, never pasted into script text.
+When all three fail, the message lists each way's reason and the manual fix (Send to >
+Desktop). A Microsoft Store Python's `pythonw.exe` under `Program Files\WindowsApps` is
+replaced by its app alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`.
+The native way was tested under Wine with Windows Python 3.12 (Wine doesn't store the app ID).
+
+**Installer.** `Install Squish.bat` copies the unzipped folder to
+`%LOCALAPPDATA%\Programs\Squish` (robocopy `/MIR`, skipping `__pycache__`; xcopy if robocopy
+is missing or fails), then makes the shortcuts for that copy, so it doesn't matter where the
+download was unzipped (Downloads included) and the download can be deleted. Running it again
+updates Squish; projects and settings live in `%APPDATA%\Squish` and caches in
+`%LOCALAPPDATA%\Squish`, which it never touches. If the copy fails, the shortcuts point at
+the unzipped folder instead and the installer says not to delete it. When the shortcuts
+can't be made, it says so and opens the installed folder in Explorer.
 Non-Windows: `(False, "Desktop shortcuts are only created on Windows")`.
 
 ## Documents (v1.1): condensing Word, Excel, PowerPoint and PDF files

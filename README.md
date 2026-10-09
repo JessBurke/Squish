@@ -25,19 +25,18 @@ You can set up as many projects as you like; Squish remembers each one.
 
 ## One-time setup
 
-1. **Put the Squish folder somewhere permanent**, for example
-   `Documents\Squish App`. (Not your Downloads folder, and not inside a zip file -
-   if you received a zip, right-click it and choose *Extract All...* first.
-   The installer stops if it is run from Downloads or straight from an Outlook
-   attachment, because Windows may clean those folders up later.)
+1. **Unzip the download.** Right-click the zip and choose *Extract All...* -
+   anywhere is fine, your Downloads folder included.
 
    *Tip:* before extracting, right-click the zip, choose *Properties*, tick
    **Unblock** and click *OK*. Windows then won't stop you when you run the
    `.bat` files.
-2. **Double-click `Install Squish.bat`.** It:
+2. **Double-click `Install Squish.bat`** in the unzipped folder. It:
    - checks that Python is installed,
    - installs optional helpers for reading Outlook files and PDFs (if your
      network blocks this, that's fine - Squish has its own readers built in),
+   - copies Squish into your user folder (`AppData\Local\Programs\Squish` - no
+     admin rights needed),
    - puts a **Squish** shortcut on your Desktop and in the Start Menu,
    - offers to open Squish.
 
@@ -45,10 +44,11 @@ You can set up as many projects as you like; Squish remembers each one.
    *Run anyway*. If it says **"The publisher could not be verified"**, click
    *Run*. Squish is a plain script that runs on your computer and uploads
    nothing.
-3. That's it. From now on, open Squish from the Desktop or Start Menu.
+3. That's it. From now on, open Squish from the Desktop or Start Menu. You can
+   delete the downloaded zip and folder.
 
-**Don't move the Squish folder after installing.** The shortcuts point at it. If
-you do move it, just run `Install Squish.bat` again.
+**Updating Squish:** download the new version, unzip it and run
+`Install Squish.bat` again. Your projects and settings are kept.
 
 ### If Python isn't installed
 
@@ -208,14 +208,17 @@ the emails themselves.
 
 ## Troubleshooting
 
-**The shortcut didn't appear.** In Squish, use *Tools > Create desktop shortcut*.
-If that's blocked on your computer, you can always double-click `Squish.pyw` in
-the Squish folder, or right-click it and choose *Send to > Desktop (create
-shortcut)* (on Windows 11, click *Show more options* first).
+**The shortcut didn't appear.** Run `Install Squish.bat` again and read what it
+says under "Creating the shortcuts". Squish tries three ways to make a shortcut
+(Windows' own shortcut function, PowerShell, then Windows Script Host). If your
+computer blocks all three, the installer says so and opens the folder Squish is
+installed in: double-click `Squish.pyw` there to start Squish, or right-click it
+and choose *Send to > Desktop (create shortcut)* (on Windows 11, click *Show more
+options* first). Inside Squish, *Tools > Create desktop shortcut* tries again.
+Also check the Start Menu: search for **Squish**.
 
-**Double-clicking the Squish shortcut does nothing.** The Squish folder was
-probably moved or deleted. Put it back, or run `Install Squish.bat` again from
-its new place to remake the shortcuts.
+**Double-clicking the Squish shortcut does nothing.** Python may have been
+removed or upgraded. Run `Install Squish.bat` again to remake the shortcuts.
 
 **"Can't find the email folder".** If it's on a network drive (like `H:`), make
 sure you're connected to the office network or VPN and that the drive opens in
